@@ -5,8 +5,9 @@ import numpy as np
 
 # Tambahkan project root ke sys.path agar modul core/cache_io dapat diimpor
 project_root = r"c:\Users\vivobook\OneDrive\Documents\TA\personal_image_search"
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+src_path = os.path.join(project_root, "src")
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
 
 # Definisikan path folder dummy di scratch
 scratch_dir = r"C:\Users\vivobook\.gemini\antigravity-ide\brain\f4ebb324-8c9d-4bfe-af65-21707e64fea3\scratch"

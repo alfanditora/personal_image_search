@@ -5,6 +5,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+CHUNK_SIZE = 16  # images per batch-embedding call
+
 # Set logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -51,10 +53,14 @@ class PipelineWorker(threading.Thread):
             
             # 1. Inisialisasi utilitas
             fm = FileManager(self.folder_path)
-            detector = self.detector if self.detector is not None else FaceDetector()
+            detector = self.detector if self.detector is not None else FaceDetector("scrfd")
             embedder = self.embedder if self.embedder is not None else ArcFaceEmbedder()
             cache_handler = CacheHandler(self.folder_path)
-            
+
+            # Reset timing accumulators for this indexing run
+            detector.reset_timings()
+            embedder.reset_timings()
+
             # Pemuatan cache yang ada untuk incremental indexing (menghindari re-proses file yang sudah ada)
             try:
                 existing_cache = cache_handler.muat_seluruh_cache()
@@ -69,64 +75,78 @@ class PipelineWorker(threading.Thread):
                 return
             photo_list = fm.dapatkan_daftar_foto()
             total_photos = len(photo_list)
-            
+
             if total_photos == 0:
                 logger.info("Tidak ada gambar valid yang ditemukan di direktori input.")
-                self.on_finished(0)
+                self.on_finished(0, {})
                 return
-                
+
             processed_count = 0
-            
-            # 3. Proses sekuensial masing-masing foto (batch processing)
+
+            # 3a. Phase 1: pisahkan file yang sudah di-cache (fast path) dari yang baru
+            new_photos = []  # list of (global_idx, photo_path)
             for idx, photo_path in enumerate(photo_list):
-                # Proteksi anti-leak dan anti-freeze saat ditutup paksa
+                file_name_rel = str(photo_path.relative_to(fm.input_dir))
+                if file_name_rel in processed_files:
+                    processed_count += 1
+                    self.on_progress(idx + 1, total_photos, f"[Cached] {photo_path.name}")
+                else:
+                    new_photos.append((idx, photo_path))
+
+            # 3b. Phase 2: proses foto baru dalam chunk (detect → batch embed → cache)
+            for chunk_start in range(0, len(new_photos), CHUNK_SIZE):
                 if self.stopped():
                     logger.info("PipelineWorker dihentikan oleh pengguna secara paksa.")
                     return
-                    
-                file_name_rel = str(photo_path.relative_to(fm.input_dir))
-                
-                # Inkremental: Skip jika file sudah pernah diproses dan ada di cache
-                if file_name_rel in processed_files:
-                    processed_count += 1
-                    # Kirim kemajuan realtime ke UI utama
-                    self.on_progress(idx + 1, total_photos, f"[Cached] {photo_path.name}")
-                    continue
-                
-                try:
-                    # Validasi biner & muat citra
-                    img = fm.validasi_dan_baca_citra(str(photo_path))
-                    if img is None:
-                        # Gambar corrupt, abaikan dan lanjut sekuensial (NF3)
-                        continue
-                        
-                    # Deteksi dan crop (menghasilkan wajah 112x112 yang di-align)
-                    faces = detector.detect_and_crop(str(photo_path))
-                    
-                    # Simpan cache metadata masing-masing wajah terdeteksi
-                    for face_idx, face_data in enumerate(faces):
-                        if self.stopped():
-                            return
-                        cropped_face = face_data["cropped_face"]
-                        bbox = face_data["bbox"]
-                        
-                        # Ekstraksi embedding 512-dimensi L2 normalized
-                        embedding = embedder.extract_embedding(cropped_face)
-                        
-                        # Simpan ke cache JSON lokal
-                        cache_handler.simpan_cache(file_name_rel, embedding, bbox)
-                        
-                    processed_count += 1
-                    
-                except Exception as e:
-                    logger.warning(f"Modul gagal memproses file {photo_path.name}: {str(e)}. Melanjutkan batch...")
-                    
-                # Kirim kemajuan realtime ke UI utama
-                self.on_progress(idx + 1, total_photos, photo_path.name)
-                
+
+                chunk = new_photos[chunk_start: chunk_start + CHUNK_SIZE]
+
+                # Step A: Deteksi + alignment semua foto dalam chunk
+                detected_chunk = []  # list of (file_name_rel, faces_list)
+                for global_idx, photo_path in chunk:
+                    if self.stopped():
+                        return
+                    file_name_rel = str(photo_path.relative_to(fm.input_dir))
+                    try:
+                        faces = detector.detect_and_crop(str(photo_path))
+                    except Exception as e:
+                        logger.warning(f"Gagal deteksi {photo_path.name}: {str(e)}. Dilewati.")
+                        faces = []
+                    detected_chunk.append((file_name_rel, faces))
+                    self.on_progress(global_idx + 1, total_photos, photo_path.name)
+
+                # Step B: Kumpulkan semua crop wajah untuk batch embedding
+                all_crops = []
+                metadata = []  # (file_name_rel, bbox)
+                for file_name_rel, faces in detected_chunk:
+                    for face_data in faces:
+                        all_crops.append(face_data["cropped_face"])
+                        metadata.append((file_name_rel, face_data["bbox"]))
+
+                # Step C: Satu batch embedding call → tulis cache semua sekaligus
+                if all_crops:
+                    try:
+                        embeddings = embedder.extract_embeddings_batch(all_crops)
+                        for emb, (fname, bbox) in zip(embeddings, metadata):
+                            cache_handler.simpan_cache(fname, emb, bbox)
+                        logger.info(
+                            f"Batch chunk {chunk_start//CHUNK_SIZE + 1}: "
+                            f"{len(all_crops)} wajah dari {len(chunk)} foto diproses."
+                        )
+                    except Exception as e:
+                        logger.error(f"Batch embedding gagal pada chunk ini: {str(e)}")
+
+                processed_count += len(chunk)
+
             # Jalankan callback selesai
             if not self.stopped():
-                self.on_finished(processed_count)
+                timings = {
+                    "detection":  detector.total_detection_time,
+                    "alignment":  detector.total_alignment_time,
+                    "embedding":  embedder.total_embedding_time,
+                    "new_images": len(new_photos),
+                }
+                self.on_finished(processed_count, timings)
                 
         except Exception as e:
             logger.error(f"Kegagalan fatal pada background PipelineWorker: {str(e)}")
@@ -177,7 +197,7 @@ class SearchWorker(threading.Thread):
             
             # Inisialisasi
             fm = FileManager(self.folder_path)
-            detector = self.detector if self.detector is not None else FaceDetector()
+            detector = self.detector if self.detector is not None else FaceDetector("scrfd")
             embedder = self.embedder if self.embedder is not None else ArcFaceEmbedder()
             matcher = FaceMatcher(threshold=self.threshold)
             cache_handler = CacheHandler(self.folder_path)

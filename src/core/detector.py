@@ -1,4 +1,5 @@
 import os
+import time
 import cv2
 import logging
 import numpy as np
@@ -30,10 +31,11 @@ class FaceDetector:
             try:
                 from scrfd import SCRFD
                 # Gunakan model det_2.5g.onnx yang tersimpan di folder models
-                model_path = os.path.join("models", "det_2.5g.onnx")
+                # Resolve relative to project root (two levels up from src/core/)
+                model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "models", "det_2.5g.onnx"))
                 if not os.path.exists(model_path):
-                    # Fallback jika dijalankan dari subdirektori (misal tests/ atau algorithm_exploration/)
-                    model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models", "det_2.5g.onnx"))
+                    # Fallback: relative to CWD
+                    model_path = os.path.join("models", "det_2.5g.onnx")
                 
                 self.detector = SCRFD.from_path(model_path)
                 logger.info(f"Detektor wajah SCRFD berhasil diinisialisasi dari {model_path}.")
@@ -42,6 +44,14 @@ class FaceDetector:
                 raise RuntimeError(f"Gagal menginisialisasi SCRFD: {str(e)}")
         else:
             raise ValueError(f"Tipe detektor tidak dikenal: {detector_type}. Harus 'mtcnn' atau 'scrfd'.")
+
+        # Timing accumulators (reset per indexing run via reset_timings())
+        self.total_detection_time = 0.0
+        self.total_alignment_time = 0.0
+
+    def reset_timings(self):
+        self.total_detection_time = 0.0
+        self.total_alignment_time = 0.0
 
     def _detect_faces_safe(self, img: np.ndarray, initial_max_dim: int = 960) -> tuple[list, float]:
         """
@@ -204,18 +214,29 @@ class FaceDetector:
             return []
             
         try:
-            # 2. Muat gambar asli beresolusi tinggi menggunakan OpenCV
+            # 2. Muat gambar asli menggunakan OpenCV
             img = cv2.imread(img_path)
             if img is None:
                 logger.warning(f"Gagal memuat gambar (Format corrupt atau tidak didukung): {img_path}")
                 return []
                 
             orig_h, orig_w = img.shape[:2]
+            max_dim = max(orig_h, orig_w)
+            if max_dim > 1080:
+                scale = 1080.0 / max_dim
+                target_w = int(orig_w * scale)
+                target_h = int(orig_h * scale)
+                img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                logger.info(f"Gambar resolusi tinggi di-downscale dari {orig_w}x{orig_h} ke {target_w}x{target_h} (max 1080px).")
+                orig_h, orig_w = img.shape[:2]
             
             # 3. Deteksi wajah secara aman & adaptif terhadap memori (menggunakan helper _detect_faces_safe)
+            _t_det = time.perf_counter()
             faces, scale = self._detect_faces_safe(img, initial_max_dim=960)
-            
+            self.total_detection_time += time.perf_counter() - _t_det
+
             # 4. Iterasi dan prapemrosesan masing-masing wajah terdeteksi
+            _t_align = time.perf_counter()
             for face in faces:
                 x, y, w, h = face['box']
                 
@@ -267,7 +288,8 @@ class FaceDetector:
                     "cropped_face": aligned_face,
                     "bbox": (int(x_orig), int(y_orig), int(w_orig), int(h_orig))
                 })
-                
+
+            self.total_alignment_time += time.perf_counter() - _t_align
             return results
             
         except Exception as e:

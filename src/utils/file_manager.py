@@ -34,26 +34,30 @@ class FileManager:
             
         logger.info(f"FileManager siap mengelola direktori: {self.input_dir}")
 
+    # Folder output pencarian — dikecualikan dari pemindaian agar tidak ikut terindeks
+    _EXCLUDED_DIRS = {".face_cache", "Hasil_Pencarian_Selfie"}
+
     def dapatkan_daftar_foto(self) -> list[Path]:
         """
         Membaca direktori input secara sekuensial dan rekursif untuk menemukan seluruh berkas
         foto yang memiliki ekstensi valid (.jpg, .jpeg, .png) secara case-insensitive.
-        Secara otomatis mengabaikan berkas di dalam subdirektori cache tersembunyi (misal: .face_cache).
-        
+        Secara otomatis mengabaikan berkas di dalam subdirektori cache tersembunyi (misal: .face_cache)
+        dan folder output hasil pencarian (Hasil_Pencarian_Selfie).
+
         Returns:
             list[Path]: Daftar objek Path berkas gambar yang ditemukan.
         """
         valid_extensions = {".jpg", ".jpeg", ".png"}
         photo_paths = []
-        
+
         try:
             # Melakukan penyusuran rekursif menggunakan rglob
             for path in self.input_dir.rglob("*"):
-                # Abaikan berkas di dalam subdirektori tersembunyi (dimulai dengan titik, seperti .face_cache)
-                # Dapatkan bagian path relatif terhadap input_dir
+                # Abaikan berkas di dalam subdirektori yang dikecualikan
+                # (tersembunyi seperti .face_cache, atau folder output seperti Hasil_Pencarian_Selfie)
                 try:
                     rel_path = path.relative_to(self.input_dir)
-                    if any(part.startswith(".") for part in rel_path.parts):
+                    if any(part.startswith(".") or part in self._EXCLUDED_DIRS for part in rel_path.parts):
                         continue
                 except ValueError:
                     continue
