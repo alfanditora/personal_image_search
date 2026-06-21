@@ -560,15 +560,11 @@ class DemoApp(MainApp):
         metrics_row = ctk.CTkFrame(self._report_frame, fg_color=C_REPORT_BG)
         metrics_row.pack(fill="x", padx=16, pady=(0, 8))
 
-        mins, secs = divmod(self._elapsed, 60)
-        time_str = f"{int(mins)}m {secs:.1f}s" if mins >= 1 else f"{self._elapsed:.1f}s"
-
         metrics = [
             ("Precision",    f"{precision:.3f}", C_SUCCESS if precision >= 0.7 else C_WARNING),
             ("Recall",       f"{recall:.3f}",    C_SUCCESS if recall    >= 0.7 else C_WARNING),
             ("F1-Score",     f"{f1:.3f}",        C_SUCCESS if f1        >= 0.7 else C_WARNING),
             ("Accuracy",     f"{accuracy:.3f}",  C_SUCCESS if accuracy  >= 0.8 else C_WARNING),
-            ("Waktu Cari",   time_str,            C_ACCENT),
         ]
 
         for name, val, color in metrics:
@@ -586,37 +582,8 @@ class DemoApp(MainApp):
                 fg_color=BG_CARD,
             ).pack(pady=(0, 8))
 
-        # ── Indexing timing breakdown ─────────────────────────────────────────
+        # ── Timing ────────────────────────────────────────────────────────────
         timings = getattr(self, "_index_timings", {})
-
-        timing_hdr = ctk.CTkFrame(self._report_frame, fg_color=C_REPORT_BG)
-        timing_hdr.pack(fill="x", padx=16, pady=(4, 4))
-        timing_hdr.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            timing_hdr, text="TIMING INDEXING",
-            font=ctk.CTkFont("Segoe UI", 10, "bold"), text_color=C_SUBTEXT,
-            fg_color=C_REPORT_BG, anchor="w",
-        ).grid(row=0, column=0, sticky="w")
-
-        if timings and timings.get("new_images", 0) > 0:
-            n = timings["new_images"]
-            ctk.CTkLabel(
-                timing_hdr,
-                text=f"{n} gambar baru diproses",
-                font=ctk.CTkFont("Segoe UI", 9), text_color=C_MUTED,
-                fg_color=C_REPORT_BG,
-            ).grid(row=0, column=1, sticky="e")
-        else:
-            ctk.CTkLabel(
-                timing_hdr,
-                text="semua dari cache  ·  tidak ada indexing baru",
-                font=ctk.CTkFont("Segoe UI", 9), text_color=C_MUTED,
-                fg_color=C_REPORT_BG,
-            ).grid(row=0, column=1, sticky="e")
-
-        timing_row = ctk.CTkFrame(self._report_frame, fg_color=C_REPORT_BG)
-        timing_row.pack(fill="x", padx=16, pady=(0, 12))
 
         def _fmt(secs_f):
             m, s = divmod(secs_f, 60)
@@ -625,13 +592,13 @@ class DemoApp(MainApp):
         det_t   = timings.get("detection", 0.0)
         align_t = timings.get("alignment", 0.0)
         emb_t   = timings.get("embedding", 0.0)
-        total_t = det_t + align_t + emb_t
+
+        timing_row = ctk.CTkFrame(self._report_frame, fg_color=C_REPORT_BG)
+        timing_row.pack(fill="x", padx=16, pady=(0, 12))
 
         timing_tiles = [
-            ("Deteksi Wajah",   _fmt(det_t),   "#EFF6FF", "#1D4ED8"),
-            ("Alignment",       _fmt(align_t),  "#F0FDF4", "#15803D"),
-            ("Ekstraksi Fitur", _fmt(emb_t),    "#FFF7ED", "#C2410C"),
-            ("Total Pipeline",  _fmt(total_t),  "#F5F3FF", "#6D28D9"),
+            ("Total Indeksasi", _fmt(det_t + align_t + emb_t), "#EFF6FF", "#1D4ED8"),
+            ("Waktu Pencarian", _fmt(self._elapsed),             "#F0FDF4", "#15803D"),
         ]
 
         for name, val, bg, fg in timing_tiles:
