@@ -71,6 +71,48 @@ def test_vector_search_and_sorting():
     
     print("Uji Penyaringan dan Pengurutan: LOLOS\n")
 
+def test_dedup_multiple_faces_same_photo():
+    print("=== Uji Deduplikasi Foto Grup (Beberapa Wajah dalam 1 Foto yang Sama) ===")
+    from core.matcher import FaceMatcher
+
+    matcher = FaceMatcher(threshold=0.40)
+
+    query = np.zeros(512, dtype=np.float32)
+    query[0] = 1.0
+
+    # Dua wajah berbeda pada FOTO YANG SAMA (foto_grup.png), keduanya cocok dengan kueri
+    emb_identical = np.zeros(512, dtype=np.float32)
+    emb_identical[0] = 1.0  # distance = 0.0
+
+    emb_similar = np.zeros(512, dtype=np.float32)
+    emb_similar[0] = 0.8
+    emb_similar[1] = 0.6  # distance = 0.2
+
+    # Satu wajah pada foto lain yang berbeda
+    emb_other_photo = np.zeros(512, dtype=np.float32)
+    emb_other_photo[0] = 0.9
+    emb_other_photo[1] = np.sqrt(1 - 0.9 ** 2)
+
+    cache_list = [
+        {"id": "face_A_grup", "file_name": "foto_grup.png", "embedding": emb_similar, "bbox": (0, 0, 10, 10)},
+        {"id": "face_B_grup", "file_name": "foto_grup.png", "embedding": emb_identical, "bbox": (50, 50, 10, 10)},
+        {"id": "face_C_lain", "file_name": "foto_lain.png", "embedding": emb_other_photo, "bbox": (0, 0, 10, 10)},
+    ]
+
+    matches = matcher.cari_foto_cocok(query, cache_list)
+
+    print(f"Jumlah kecocokan setelah deduplikasi: {len(matches)} (Diharapkan: 2 foto unik)")
+    assert len(matches) == 2, "Foto yang sama dengan beberapa wajah cocok harus muncul hanya sekali."
+
+    file_names = [m["file_name"] for m in matches]
+    assert len(file_names) == len(set(file_names)), "Tidak boleh ada file_name duplikat pada hasil pencocokan."
+
+    # Untuk foto_grup.png, kecocokan yang disimpan harus wajah dengan jarak terkecil (face_B_grup)
+    grup_match = next(m for m in matches if m["file_name"] == "foto_grup.png")
+    assert grup_match["id"] == "face_B_grup", "Kecocokan terbaik (jarak terkecil) yang harus dipertahankan saat deduplikasi."
+
+    print("Uji Deduplikasi Foto Grup: LOLOS\n")
+
 def test_robustness_on_corrupt_embeddings():
     print("=== Uji Ketahanan Data Corrupt / Embedding Rusak (NF3) ===")
     from core.matcher import FaceMatcher
@@ -102,6 +144,7 @@ if __name__ == "__main__":
     try:
         test_identical_vector_distance()
         test_vector_search_and_sorting()
+        test_dedup_multiple_faces_same_photo()
         test_robustness_on_corrupt_embeddings()
         print("SEMUA UNIT TEST UNTUK MATCHER LOLOS DENGAN SUKSES!")
     except Exception as e:

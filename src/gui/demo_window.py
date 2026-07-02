@@ -94,7 +94,7 @@ class DemoApp(MainApp):
         self._threshold    = ctk.DoubleVar(value=0.60)
         self._query_person = ctk.StringVar(value="A")
 
-        wrapper = ctk.CTkFrame(parent, width=296, fg_color=C_BORDER, corner_radius=0)
+        wrapper = ctk.CTkFrame(parent, width=500, fg_color=C_BORDER, corner_radius=0)
         wrapper.grid(row=0, column=0, sticky="nsew")
         wrapper.grid_propagate(False)
 
@@ -113,20 +113,58 @@ class DemoApp(MainApp):
         self._section_label(sb, "INPUT FOLDER").grid(
             row=r, column=0, sticky="w", padx=16, pady=(24, 4)); r += 1
 
-        self.folder_label = ctk.CTkLabel(
-            sb, text="Belum dipilih",
-            font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED,
-            anchor="w", wraplength=252,
+        self.input_mode_seg = ctk.CTkSegmentedButton(
+            sb, values=["Folder Lokal", "Google Drive"],
+            font=ctk.CTkFont("Segoe UI", 11),
+            fg_color=BG_INPUT, selected_color=C_ACCENT, selected_hover_color=C_ACCENT_HV,
+            unselected_color=BG_INPUT, unselected_hover_color=C_BORDER,
+            command=self._on_input_mode_changed,
         )
-        self.folder_label.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 6)); r += 1
+        self.input_mode_seg.set("Folder Lokal")
+        self.input_mode_seg.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 8)); r += 1
+
+        # Kedua frame berikut menempati baris grid yang sama; hanya satu yang tampak sekaligus.
+        input_row = r; r += 1
+
+        self.local_input_frame = ctk.CTkFrame(sb, fg_color="transparent")
+        self.local_input_frame.grid(row=input_row, column=0, sticky="ew", padx=0, pady=0)
+        self.local_input_frame.grid_columnconfigure(0, weight=1)
+
+        self.folder_label = ctk.CTkLabel(
+            self.local_input_frame, text="Belum dipilih",
+            font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED,
+            anchor="w", wraplength=456,
+        )
+        self.folder_label.grid(row=0, column=0, sticky="ew", padx=16, pady=(0, 6))
 
         ctk.CTkButton(
-            sb, text="Pilih Folder",
+            self.local_input_frame, text="Pilih Folder",
             font=ctk.CTkFont("Segoe UI", 12),
             fg_color=BG_INPUT, hover_color=C_BORDER, text_color=C_TEXT,
             height=36, corner_radius=8, border_width=1, border_color=C_BORDER,
             command=self._select_folder,
-        ).grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 6)); r += 1
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 6))
+
+        self.drive_input_frame = ctk.CTkFrame(sb, fg_color="transparent")
+        self.drive_input_frame.grid(row=input_row, column=0, sticky="ew", padx=0, pady=0)
+        self.drive_input_frame.grid_columnconfigure(0, weight=1)
+
+        self.drive_entry = ctk.CTkEntry(
+            self.drive_input_frame, placeholder_text="Tempel tautan folder Google Drive...",
+            font=ctk.CTkFont("Segoe UI", 11),
+            fg_color=BG_INPUT, border_color=C_BORDER, text_color=C_TEXT,
+            height=36, corner_radius=8,
+        )
+        self.drive_entry.grid(row=0, column=0, sticky="ew", padx=16, pady=(0, 6))
+
+        ctk.CTkLabel(
+            self.drive_input_frame,
+            text="Cache & hasil pencarian akan disimpan di folder Drive ini juga.",
+            font=ctk.CTkFont("Segoe UI", 10), text_color=C_MUTED,
+            anchor="w", wraplength=456, justify="left",
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 6))
+
+        self.drive_input_frame.grid_remove()  # tersembunyi selama mode lokal aktif
 
         self.btn_index = ctk.CTkButton(
             sb, text="Indeks Foto",
@@ -146,7 +184,7 @@ class DemoApp(MainApp):
         self.selfie_label = ctk.CTkLabel(
             sb, text="Belum dipilih",
             font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED,
-            anchor="w", wraplength=252,
+            anchor="w", wraplength=456,
         )
         self.selfie_label.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 6)); r += 1
 
@@ -176,7 +214,7 @@ class DemoApp(MainApp):
         self._gt_status_label = ctk.CTkLabel(
             sb, text="Belum dimuat",
             font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED,
-            anchor="w", wraplength=252, fg_color=BG_SIDEBAR,
+            anchor="w", wraplength=456, fg_color=BG_SIDEBAR,
         )
         self._gt_status_label.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 6)); r += 1
 
@@ -255,7 +293,7 @@ class DemoApp(MainApp):
         self.status_label = ctk.CTkLabel(
             sb, text="Siap",
             font=ctk.CTkFont("Segoe UI", 11), text_color=C_SUBTEXT,
-            anchor="w", wraplength=252, fg_color=BG_SIDEBAR,
+            anchor="w", wraplength=456, fg_color=BG_SIDEBAR,
         )
         self.status_label.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 4)); r += 1
 
@@ -315,8 +353,12 @@ class DemoApp(MainApp):
     # ── Override search to read slider threshold ──────────────────────────────
 
     def _start_search(self):
-        if not self.folder_path:
+        drive_link = self._get_drive_link()
+        if self.input_mode == "local" and not self.folder_path:
             messagebox.showwarning("Folder Belum Dipilih", "Pilih folder foto terlebih dahulu.")
+            return
+        if self.input_mode == "drive" and not drive_link:
+            messagebox.showwarning("Tautan Drive Belum Diisi", "Tempel tautan folder Google Drive terlebih dahulu.")
             return
         if not self.selfie_path:
             messagebox.showwarning("Selfie Belum Dipilih", "Pilih foto selfie terlebih dahulu.")
@@ -342,6 +384,7 @@ class DemoApp(MainApp):
         from gui.workers import SearchWorker
         self.active_worker = SearchWorker(
             folder_path=self.folder_path,
+            drive_link=drive_link or None,
             query_img_path=self.selfie_path,
             threshold=threshold,
             on_progress=self._on_search_progress,
@@ -501,13 +544,24 @@ class DemoApp(MainApp):
         if self._ground_truth_raw:
             person_label = f"Person {self._query_person.get()}"
 
+        # Jumlah wajah yang berhasil dideteksi oleh face detection saat proses indexing terakhir
+        faces_detected = self._index_timings.get("faces_detected")
+        # Total waktu sinkronisasi Google Drive (indexing + search), 0 jika mode lokal
+        drive_sync_time = (
+            self._index_timings.get("drive_sync_time", 0.0)
+            + getattr(self.active_worker, "drive_sync_time", 0.0)
+        )
+
         self._render_report(tp, fp, fn, tn, precision, recall, f1, accuracy,
                             person_label=person_label,
                             total_images=total_images,
-                            positive_count=len(gt_positive))
+                            positive_count=len(gt_positive),
+                            faces_detected=faces_detected,
+                            drive_sync_time=drive_sync_time)
 
     def _render_report(self, tp, fp, fn, tn, precision, recall, f1, accuracy,
-                       person_label=None, total_images=None, positive_count=None):
+                       person_label=None, total_images=None, positive_count=None,
+                       faces_detected=None, drive_sync_time=0.0):
         for w in self._report_frame.winfo_children():
             w.destroy()
 
@@ -532,6 +586,24 @@ class DemoApp(MainApp):
                 font=ctk.CTkFont("Segoe UI", 9), text_color=C_MUTED,
                 fg_color=C_REPORT_BG,
             ).grid(row=0, column=1, sticky="e")
+
+        # ── Wajah terdeteksi (face detection) ───────────────────────────────────
+        if faces_detected is not None:
+            det_row = ctk.CTkFrame(self._report_frame, fg_color=C_REPORT_BG)
+            det_row.pack(fill="x", padx=16, pady=(0, 8))
+            det_tile = ctk.CTkFrame(det_row, fg_color="#EEF2FF", corner_radius=8,
+                                     border_width=1, border_color=C_BORDER)
+            det_tile.pack(fill="x")
+            ctk.CTkLabel(
+                det_tile, text=str(faces_detected),
+                font=ctk.CTkFont("Segoe UI", 16, "bold"), text_color="#4338CA",
+                fg_color="#EEF2FF",
+            ).pack(side="left", padx=(16, 8), pady=8)
+            ctk.CTkLabel(
+                det_tile, text="wajah terdeteksi oleh face detection (total cache saat ini)",
+                font=ctk.CTkFont("Segoe UI", 10), text_color=C_SUBTEXT,
+                fg_color="#EEF2FF",
+            ).pack(side="left", pady=8)
 
         # ── Confusion counts ──────────────────────────────────────────────────
         counts_row = ctk.CTkFrame(self._report_frame, fg_color=C_REPORT_BG)
@@ -600,6 +672,8 @@ class DemoApp(MainApp):
             ("Total Indeksasi", _fmt(det_t + align_t + emb_t), "#EFF6FF", "#1D4ED8"),
             ("Waktu Pencarian", _fmt(self._elapsed),             "#F0FDF4", "#15803D"),
         ]
+        if drive_sync_time > 0:
+            timing_tiles.append(("Sinkronisasi Drive", _fmt(drive_sync_time), "#FEF3C7", "#B45309"))
 
         for name, val, bg, fg in timing_tiles:
             tile = ctk.CTkFrame(timing_row, fg_color=bg, corner_radius=8,

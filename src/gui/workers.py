@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 import threading
 from pathlib import Path
@@ -12,16 +13,18 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class PipelineWorker(threading.Thread):
-    def __init__(self, folder_path: str, on_progress, on_finished, on_error, detector=None, embedder=None):
+    def __init__(self, folder_path: str, on_progress, on_finished, on_error, detector=None, embedder=None, drive_link: str = None):
         """
         Background worker untuk memproses pemindaian gambar, deteksi wajah,
         penyelarasan afin, ekstraksi embedding ArcFace, dan penulisan cache Zero-DB.
-        
+
         Args:
-            folder_path (str): Jalur direktori utama tempat kumpulan foto disimpan.
+            folder_path (str): Jalur direktori utama tempat kumpulan foto disimpan (mode lokal).
             on_progress (callable): Callback untuk melaporkan kemajuan (current, total, file_name).
             on_finished (callable): Callback saat proses selesai (jumlah_terproses).
             on_error (callable): Callback jika terjadi galat fatal.
+            drive_link (str, optional): Tautan/ID folder Google Drive. Jika diisi, folder_path
+                diabaikan dan pemrosesan berjalan terhadap folder Drive tersebut (lihat drive_io.DriveManager).
         """
         super().__init__()
         self.folder_path = folder_path
@@ -30,6 +33,7 @@ class PipelineWorker(threading.Thread):
         self.on_error = on_error
         self.detector = detector
         self.embedder = embedder
+        self.drive_link = drive_link
         self._stop_event = threading.Event()
         self.daemon = True # Biarkan thread mati jika aplikasi utama ditutup
 
@@ -50,12 +54,28 @@ class PipelineWorker(threading.Thread):
             from core.detector import FaceDetector
             from core.embedder import ArcFaceEmbedder
             from cache_io.cache_handler import CacheHandler
-            
+
+            # 0. Jika sumber input adalah Google Drive, sinkronkan dahulu ke folder staging lokal
+            drive = None
+            effective_folder = self.folder_path
+            drive_download_time = 0.0
+            drive_upload_time = 0.0
+            if self.drive_link:
+                from drive_io.drive_manager import DriveManager
+                self.on_progress(0, 1, "Menghubungkan ke Google Drive...")
+                drive = DriveManager(self.drive_link)
+                local_root = Path.home() / ".personal_image_search" / "drive_cache" / drive.root_folder_id
+                self.on_progress(0, 1, "Menyinkronkan foto & cache dari Google Drive...")
+                _t0 = time.time()
+                drive.download_folder_to_local(local_root)
+                drive_download_time = time.time() - _t0
+                effective_folder = str(local_root)
+
             # 1. Inisialisasi utilitas
-            fm = FileManager(self.folder_path)
+            fm = FileManager(effective_folder)
             detector = self.detector if self.detector is not None else FaceDetector("scrfd")
             embedder = self.embedder if self.embedder is not None else ArcFaceEmbedder()
-            cache_handler = CacheHandler(self.folder_path)
+            cache_handler = CacheHandler(effective_folder)
 
             # Reset timing accumulators for this indexing run
             detector.reset_timings()
@@ -78,10 +98,14 @@ class PipelineWorker(threading.Thread):
 
             if total_photos == 0:
                 logger.info("Tidak ada gambar valid yang ditemukan di direktori input.")
-                self.on_finished(0, {})
+                self.on_finished(0, {
+                    "drive_sync_time": drive_download_time + drive_upload_time,
+                    "faces_detected": len(existing_cache),
+                })
                 return
 
             processed_count = 0
+            new_faces_count = 0  # jumlah wajah baru yang berhasil dideteksi pada run ini
 
             # 3a. Phase 1: pisahkan file yang sudah di-cache (fast path) dari yang baru
             new_photos = []  # list of (global_idx, photo_path)
@@ -129,6 +153,7 @@ class PipelineWorker(threading.Thread):
                         embeddings = embedder.extract_embeddings_batch(all_crops)
                         for emb, (fname, bbox) in zip(embeddings, metadata):
                             cache_handler.simpan_cache(fname, emb, bbox)
+                        new_faces_count += len(all_crops)
                         logger.info(
                             f"Batch chunk {chunk_start//CHUNK_SIZE + 1}: "
                             f"{len(all_crops)} wajah dari {len(chunk)} foto diproses."
@@ -140,11 +165,23 @@ class PipelineWorker(threading.Thread):
 
             # Jalankan callback selesai
             if not self.stopped():
+                if drive is not None:
+                    try:
+                        self.on_progress(total_photos, total_photos, "Menyinkronkan cache baru ke Google Drive...")
+                        _t0 = time.time()
+                        drive.upload_new_cache_files(local_root)
+                        drive_upload_time = time.time() - _t0
+                    except Exception as e:
+                        logger.error(f"Gagal menyinkronkan cache baru ke Google Drive: {str(e)}")
+
                 timings = {
                     "detection":  detector.total_detection_time,
                     "alignment":  detector.total_alignment_time,
                     "embedding":  embedder.total_embedding_time,
                     "new_images": len(new_photos),
+                    "faces_detected": len(existing_cache) + new_faces_count,
+                    "new_faces_detected": new_faces_count,
+                    "drive_sync_time": drive_download_time + drive_upload_time,
                 }
                 self.on_finished(processed_count, timings)
                 
@@ -154,17 +191,19 @@ class PipelineWorker(threading.Thread):
 
 
 class SearchWorker(threading.Thread):
-    def __init__(self, folder_path: str, query_img_path: str, threshold: float, on_progress, on_finished, on_error, detector=None, embedder=None):
+    def __init__(self, folder_path: str, query_img_path: str, threshold: float, on_progress, on_finished, on_error, detector=None, embedder=None, drive_link: str = None):
         """
         Background worker untuk mencocokkan foto selfie kueri dengan seluruh data cache RAM.
-        
+
         Args:
-            folder_path (str): Jalur direktori utama tempat kumpulan foto disimpan.
+            folder_path (str): Jalur direktori utama tempat kumpulan foto disimpan (mode lokal).
             query_img_path (str): Jalur berkas kueri foto selfie sebagai acuan.
             threshold (float): Ambang batas jarak Cosine Distance.
             on_progress (callable): Callback untuk memperbarui log status.
             on_finished (callable): Callback saat pencarian selesai (matches, output_folder).
             on_error (callable): Callback jika terjadi galat.
+            drive_link (str, optional): Tautan/ID folder Google Drive. Jika diisi, folder_path
+                diabaikan dan pencarian berjalan terhadap folder Drive tersebut (lihat drive_io.DriveManager).
         """
         super().__init__()
         self.folder_path = folder_path
@@ -175,6 +214,8 @@ class SearchWorker(threading.Thread):
         self.on_error = on_error
         self.detector = detector
         self.embedder = embedder
+        self.drive_link = drive_link
+        self.drive_sync_time = 0.0  # total waktu unduh+unggah Drive pada run ini (diisi oleh run())
         self._stop_event = threading.Event()
         self.daemon = True
 
@@ -194,13 +235,27 @@ class SearchWorker(threading.Thread):
             from core.embedder import ArcFaceEmbedder
             from core.matcher import FaceMatcher
             from cache_io.cache_handler import CacheHandler
-            
+
+            # 0. Jika sumber input adalah Google Drive, sinkronkan dahulu ke folder staging lokal
+            drive = None
+            effective_folder = self.folder_path
+            if self.drive_link:
+                from drive_io.drive_manager import DriveManager
+                self.on_progress("Menghubungkan ke Google Drive...")
+                drive = DriveManager(self.drive_link)
+                local_root = Path.home() / ".personal_image_search" / "drive_cache" / drive.root_folder_id
+                self.on_progress("Menyinkronkan foto & cache dari Google Drive...")
+                _t0 = time.time()
+                drive.download_folder_to_local(local_root)
+                self.drive_sync_time += time.time() - _t0
+                effective_folder = str(local_root)
+
             # Inisialisasi
-            fm = FileManager(self.folder_path)
+            fm = FileManager(effective_folder)
             detector = self.detector if self.detector is not None else FaceDetector("scrfd")
             embedder = self.embedder if self.embedder is not None else ArcFaceEmbedder()
             matcher = FaceMatcher(threshold=self.threshold)
-            cache_handler = CacheHandler(self.folder_path)
+            cache_handler = CacheHandler(effective_folder)
             
             # 1. Prapemrosesan Foto Selfie Kueri
             if self.stopped():
@@ -250,10 +305,25 @@ class SearchWorker(threading.Thread):
             if self.stopped():
                 return
             self.on_progress(f"Menyalin {len(matches)} foto hasil kecocokan ke folder 'Hasil_Pencarian_Selfie'...")
-            
-            match_paths = [item["file_path"] for item in matches]
+
+            # Catatan: pada mode Drive, field "file_path" di cache bisa berasal dari staging
+            # lokal mesin lain (cache disinkronkan turun dari Drive), sehingga tidak bisa dipercaya
+            # begitu saja — path direkonstruksi dari "file_name" relatif terhadap folder staging saat ini.
+            if drive is not None:
+                match_paths = [str(Path(effective_folder) / item["file_name"]) for item in matches]
+            else:
+                match_paths = [item["file_path"] for item in matches]
             output_folder = fm.salin_hasil_cocok(match_paths)
-            
+
+            if drive is not None:
+                try:
+                    self.on_progress("Menyalin hasil pencocokan ke Google Drive...")
+                    _t0 = time.time()
+                    drive.copy_matches_to_drive_results([item["file_name"] for item in matches])
+                    self.drive_sync_time += time.time() - _t0
+                except Exception as e:
+                    logger.error(f"Gagal menyalin hasil pencocokan ke Google Drive: {str(e)}")
+
             if not self.stopped():
                 self.on_progress("Pencarian selesai dengan sukses!")
                 self.on_finished(matches, output_folder)

@@ -42,6 +42,7 @@ class MainApp(ctk.CTk):
 
         self.folder_path    = ""
         self.selfie_path    = ""
+        self.input_mode     = "local"  # "local" | "drive"
         self.active_worker  = None
         self.detector       = None
         self.embedder       = None
@@ -90,7 +91,7 @@ class MainApp(ctk.CTk):
         self.engine_badge.pack(side="right", padx=24)
 
     def _build_sidebar(self, parent):
-        wrapper = ctk.CTkFrame(parent, width=296, fg_color=C_BORDER, corner_radius=0)
+        wrapper = ctk.CTkFrame(parent, width=500, fg_color=C_BORDER, corner_radius=0)
         wrapper.grid(row=0, column=0, sticky="nsew")
         wrapper.grid_propagate(False)
 
@@ -109,20 +110,58 @@ class MainApp(ctk.CTk):
         self._section_label(sb, "INPUT FOLDER").grid(
             row=r, column=0, sticky="w", padx=16, pady=(24, 4)); r += 1
 
-        self.folder_label = ctk.CTkLabel(
-            sb, text="Belum dipilih",
-            font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED,
-            anchor="w", wraplength=252,
+        self.input_mode_seg = ctk.CTkSegmentedButton(
+            sb, values=["Folder Lokal", "Google Drive"],
+            font=ctk.CTkFont("Segoe UI", 11),
+            fg_color=BG_INPUT, selected_color=C_ACCENT, selected_hover_color=C_ACCENT_HV,
+            unselected_color=BG_INPUT, unselected_hover_color=C_BORDER,
+            command=self._on_input_mode_changed,
         )
-        self.folder_label.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 6)); r += 1
+        self.input_mode_seg.set("Folder Lokal")
+        self.input_mode_seg.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 8)); r += 1
+
+        # Kedua frame berikut menempati baris grid yang sama; hanya satu yang tampak sekaligus.
+        input_row = r; r += 1
+
+        self.local_input_frame = ctk.CTkFrame(sb, fg_color="transparent")
+        self.local_input_frame.grid(row=input_row, column=0, sticky="ew", padx=0, pady=0)
+        self.local_input_frame.grid_columnconfigure(0, weight=1)
+
+        self.folder_label = ctk.CTkLabel(
+            self.local_input_frame, text="Belum dipilih",
+            font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED,
+            anchor="w", wraplength=456,
+        )
+        self.folder_label.grid(row=0, column=0, sticky="ew", padx=16, pady=(0, 6))
 
         ctk.CTkButton(
-            sb, text="Pilih Folder",
+            self.local_input_frame, text="Pilih Folder",
             font=ctk.CTkFont("Segoe UI", 12),
             fg_color=BG_INPUT, hover_color=C_BORDER, text_color=C_TEXT,
             height=36, corner_radius=8, border_width=1, border_color=C_BORDER,
             command=self._select_folder,
-        ).grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 6)); r += 1
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 6))
+
+        self.drive_input_frame = ctk.CTkFrame(sb, fg_color="transparent")
+        self.drive_input_frame.grid(row=input_row, column=0, sticky="ew", padx=0, pady=0)
+        self.drive_input_frame.grid_columnconfigure(0, weight=1)
+
+        self.drive_entry = ctk.CTkEntry(
+            self.drive_input_frame, placeholder_text="Tempel tautan folder Google Drive...",
+            font=ctk.CTkFont("Segoe UI", 11),
+            fg_color=BG_INPUT, border_color=C_BORDER, text_color=C_TEXT,
+            height=36, corner_radius=8,
+        )
+        self.drive_entry.grid(row=0, column=0, sticky="ew", padx=16, pady=(0, 6))
+
+        ctk.CTkLabel(
+            self.drive_input_frame,
+            text="Cache & hasil pencarian akan disimpan di folder Drive ini juga.",
+            font=ctk.CTkFont("Segoe UI", 10), text_color=C_MUTED,
+            anchor="w", wraplength=456, justify="left",
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 6))
+
+        self.drive_input_frame.grid_remove()  # tersembunyi selama mode lokal aktif
 
         self.btn_index = ctk.CTkButton(
             sb, text="Indeks Foto",
@@ -142,7 +181,7 @@ class MainApp(ctk.CTk):
         self.selfie_label = ctk.CTkLabel(
             sb, text="Belum dipilih",
             font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED,
-            anchor="w", wraplength=252,
+            anchor="w", wraplength=456,
         )
         self.selfie_label.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 6)); r += 1
 
@@ -187,7 +226,7 @@ class MainApp(ctk.CTk):
         self.status_label = ctk.CTkLabel(
             sb, text="Siap",
             font=ctk.CTkFont("Segoe UI", 11), text_color=C_SUBTEXT,
-            anchor="w", wraplength=252, fg_color=BG_SIDEBAR,
+            anchor="w", wraplength=456, fg_color=BG_SIDEBAR,
         )
         self.status_label.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 4)); r += 1
 
@@ -289,6 +328,19 @@ class MainApp(ctk.CTk):
             self.folder_path = path
             self.folder_label.configure(text=os.path.basename(path) or path, text_color=C_TEXT)
 
+    def _on_input_mode_changed(self, value):
+        if value == "Google Drive":
+            self.input_mode = "drive"
+            self.local_input_frame.grid_remove()
+            self.drive_input_frame.grid()
+        else:
+            self.input_mode = "local"
+            self.drive_input_frame.grid_remove()
+            self.local_input_frame.grid()
+
+    def _get_drive_link(self) -> str:
+        return self.drive_entry.get().strip() if self.input_mode == "drive" else ""
+
     def _select_selfie(self):
         path = filedialog.askopenfilename(
             title="Pilih Foto Selfie",
@@ -325,8 +377,12 @@ class MainApp(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _start_indexing(self):
-        if not self.folder_path:
+        drive_link = self._get_drive_link()
+        if self.input_mode == "local" and not self.folder_path:
             messagebox.showwarning("Folder Belum Dipilih", "Pilih folder foto terlebih dahulu.")
+            return
+        if self.input_mode == "drive" and not drive_link:
+            messagebox.showwarning("Tautan Drive Belum Diisi", "Tempel tautan folder Google Drive terlebih dahulu.")
             return
         if self.active_worker and self.active_worker.is_alive():
             messagebox.showinfo("Sedang Berjalan", "Proses masih berjalan.")
@@ -337,12 +393,16 @@ class MainApp(ctk.CTk):
         self._set_buttons_state("disabled")
         self.progress_bar.set(0)
         self.prog_pct.configure(text="0%")
-        self._set_status("Memulai pengindeksan...", C_ACCENT)
+        self._set_status(
+            "Memulai autentikasi & pengindeksan Google Drive..." if drive_link else "Memulai pengindeksan...",
+            C_ACCENT,
+        )
         self._start_timer()
 
         from gui.workers import PipelineWorker
         self.active_worker = PipelineWorker(
             folder_path=self.folder_path,
+            drive_link=drive_link or None,
             on_progress=self._on_index_progress,
             on_finished=self._on_index_finished,
             on_error=self._on_error,
@@ -376,8 +436,12 @@ class MainApp(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _start_search(self):
-        if not self.folder_path:
+        drive_link = self._get_drive_link()
+        if self.input_mode == "local" and not self.folder_path:
             messagebox.showwarning("Folder Belum Dipilih", "Pilih folder foto terlebih dahulu.")
+            return
+        if self.input_mode == "drive" and not drive_link:
+            messagebox.showwarning("Tautan Drive Belum Diisi", "Tempel tautan folder Google Drive terlebih dahulu.")
             return
         if not self.selfie_path:
             messagebox.showwarning("Selfie Belum Dipilih", "Pilih foto selfie terlebih dahulu.")
@@ -400,6 +464,7 @@ class MainApp(ctk.CTk):
         from gui.workers import SearchWorker
         self.active_worker = SearchWorker(
             folder_path=self.folder_path,
+            drive_link=drive_link or None,
             query_img_path=self.selfie_path,
             threshold=FIXED_THRESHOLD,
             on_progress=self._on_search_progress,

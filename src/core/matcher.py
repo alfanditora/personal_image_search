@@ -149,8 +149,22 @@ class FaceMatcher:
             
             # 5. Urutkan hasil dari jarak terkecil (kemiripan tertinggi) ke jarak terbesar
             matches = sorted(matches, key=lambda x: x["cosine_distance"])
-            
-            logger.info(f"Proses pencocokan selesai. Menemukan {len(matches)} wajah yang cocok dari {len(daftar_cache)} data.")
+
+            # 6. Deduplikasi per foto: satu foto bisa memiliki beberapa wajah ter-cache
+            # (mis. foto grup), sehingga bisa muncul lebih dari sekali di antara matches.
+            # Simpan hanya kecocokan terbaik (jarak terkecil) per file_name agar foto
+            # yang sama tidak disalin/ditampilkan berulang kali.
+            seen_files = set()
+            deduped_matches = []
+            for item in matches:
+                fname = item["file_name"]
+                if fname in seen_files:
+                    continue
+                seen_files.add(fname)
+                deduped_matches.append(item)
+            matches = deduped_matches
+
+            logger.info(f"Proses pencocokan selesai. Menemukan {len(matches)} foto unik yang cocok dari {len(daftar_cache)} data wajah.")
             return matches
             
         except Exception as e:
