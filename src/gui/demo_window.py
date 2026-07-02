@@ -87,6 +87,8 @@ class DemoApp(MainApp):
         )
         self.engine_badge.pack(side="right", padx=24)
 
+        self._build_refresh_button(hdr).pack(side="right", padx=(0, 4))
+
     # ── Override sidebar — Ground Truth + Query Person + Threshold slider ─────
 
     def _build_sidebar(self, parent):
@@ -349,6 +351,24 @@ class DemoApp(MainApp):
     def _on_threshold_change(self, value):
         rounded = round(value / 0.05) * 0.05
         self.thresh_val_label.configure(text=f"{rounded:.2f}")
+
+    # ── Override refresh — juga reset Ground Truth, Query Person, Threshold, Report ──
+
+    def _refresh_window(self):
+        super()._refresh_window()
+
+        self._gt_path = ""
+        self._ground_truth = None
+        self._ground_truth_raw = None
+        self._gt_status_label.configure(text="Belum dimuat", text_color=C_MUTED)
+
+        self._query_person.set("A")
+        self._person_btn.configure(state="disabled")
+
+        self._threshold.set(0.60)
+        self.thresh_val_label.configure(text="0.60")
+
+        self._hide_report()
 
     # ── Override search to read slider threshold ──────────────────────────────
 

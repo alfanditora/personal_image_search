@@ -62,6 +62,8 @@ def prepare_weights() -> bool:
         return False
 
 class ArcFaceONNXRunner:
+    MAX_BATCH_SIZE = 32  # cap wajah per session.run() agar peak memory tetap terkendali
+
     def __init__(self, model_path: str = None):
         """
         Inisialisasi engine ekstraksi wajah ArcFace menggunakan ONNX Runtime.
@@ -174,8 +176,11 @@ class ArcFaceONNXRunner:
 
     def extract_embeddings_batch(self, face_images: list) -> np.ndarray:
         """
-        Ekstrak embedding untuk beberapa wajah sekaligus dalam satu session.run().
-        Lebih efisien dibanding memanggil extract_embedding() satu per satu.
+        Ekstrak embedding untuk beberapa wajah sekaligus dalam satu atau lebih panggilan
+        session.run(). Batch besar (mis. foto grup berisi banyak wajah dalam satu chunk)
+        dipecah menjadi sub-batch berukuran maksimum MAX_BATCH_SIZE agar buffer internal
+        ONNX Runtime (mis. node ReorderOutput) tidak meminta alokasi memori raksasa
+        sekaligus dan memicu BFCArena OOM.
 
         Args:
             face_images (list[np.ndarray]): Daftar citra wajah 112×112 BGR.
@@ -186,6 +191,17 @@ class ArcFaceONNXRunner:
         if not face_images:
             return np.zeros((0, 512), dtype=np.float32)
 
+        results = [
+            self._run_batch_safe(face_images[start:start + self.MAX_BATCH_SIZE])
+            for start in range(0, len(face_images), self.MAX_BATCH_SIZE)
+        ]
+        embeddings = np.concatenate(results, axis=0)
+
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return embeddings / norms
+
+    def _preprocess_batch(self, face_images: list) -> np.ndarray:
         batch = []
         for face_image in face_images:
             if len(face_image.shape) == 2:
@@ -203,20 +219,33 @@ class ArcFaceONNXRunner:
             img = np.transpose(img, (2, 0, 1))  # CHW
             batch.append(img)
 
-        batch_tensor = np.stack(batch, axis=0)  # (N, 3, 112, 112)
+        return np.stack(batch, axis=0)  # (N, 3, 112, 112)
 
+    def _run_batch_safe(self, face_images: list) -> np.ndarray:
+        """
+        Menjalankan satu sub-batch, dan jika ONNX Runtime gagal mengalokasikan memori
+        (mis. BFCArena AllocateRawInternal), coba lagi dengan sub-batch dibagi dua secara
+        rekursif hingga ukuran 1 sebelum akhirnya menyerah (meniru pola retry resolusi
+        bertahap pada FaceDetector._detect_faces_safe()).
+        """
+        batch_tensor = self._preprocess_batch(face_images)
         try:
             _t = time.perf_counter()
             raw = self.session.run([self.output_name], {self.input_name: batch_tensor})
             self.total_embedding_time += time.perf_counter() - _t
-            embeddings = np.array(raw[0], dtype=np.float32)  # (N, 512)
+            return np.array(raw[0], dtype=np.float32)  # (N, 512)
         except Exception as e:
+            if len(face_images) > 1:
+                logger.warning(
+                    f"Batch embedding ukuran {len(face_images)} gagal ({str(e)}), "
+                    f"mencoba ulang dengan sub-batch lebih kecil."
+                )
+                mid = len(face_images) // 2
+                first = self._run_batch_safe(face_images[:mid])
+                second = self._run_batch_safe(face_images[mid:])
+                return np.concatenate([first, second], axis=0)
             logger.error(f"Gagal batch embedding: {str(e)}")
             raise RuntimeError(f"Batch embedding gagal: {str(e)}")
-
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        return embeddings / norms
 
 
 # Alias untuk backward compatibility

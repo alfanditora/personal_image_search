@@ -1,7 +1,9 @@
 import os
+import gc
 import time
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image
@@ -30,6 +32,8 @@ C_HDR_BG     = "#F1F5F9"
 
 FIXED_THRESHOLD = 0.60
 THUMB_W, THUMB_H = 200, 140
+THUMB_POOL_WORKERS = 4  # cap concurrent thumbnail decodes so large result sets don't blow up RAM
+GALLERY_PAGE_SIZE = 60  # render results in pages so huge match counts don't spike widget/image RAM at once
 
 
 class MainApp(ctk.CTk):
@@ -47,6 +51,11 @@ class MainApp(ctk.CTk):
         self.detector       = None
         self.embedder       = None
         self.thumbnails     = []
+        self._thumb_executor = ThreadPoolExecutor(max_workers=THUMB_POOL_WORKERS, thread_name_prefix="thumb")
+        self._load_more_btn = None
+        self._gallery_matches = []
+        self._gallery_gt_basenames = None
+        self._gallery_shown = 0
 
         # timer state
         self._timer_start   = 0.0
@@ -89,6 +98,8 @@ class MainApp(ctk.CTk):
             text_color="#15803D",
         )
         self.engine_badge.pack(side="right", padx=24)
+
+        self._build_refresh_button(hdr).pack(side="right", padx=(0, 4))
 
     def _build_sidebar(self, parent):
         wrapper = ctk.CTkFrame(parent, width=500, fg_color=C_BORDER, corner_radius=0)
@@ -290,6 +301,15 @@ class MainApp(ctk.CTk):
     def _set_buttons_state(self, state: str):
         self.btn_index.configure(state=state)
         self.btn_search.configure(state=state)
+
+    def _build_refresh_button(self, parent) -> ctk.CTkButton:
+        return ctk.CTkButton(
+            parent, text="Refresh",
+            font=ctk.CTkFont("Segoe UI", 11),
+            fg_color=BG_INPUT, hover_color=C_BORDER, text_color=C_TEXT,
+            height=32, width=88, corner_radius=8, border_width=1, border_color=C_BORDER,
+            command=self._refresh_window,
+        )
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Timer
@@ -514,6 +534,10 @@ class MainApp(ctk.CTk):
     def _clear_gallery(self):
         for w in self.gallery_scroll.winfo_children():
             w.destroy()
+        self._load_more_btn = None
+        self._gallery_matches = []
+        self._gallery_gt_basenames = None
+        self._gallery_shown = 0
 
     def _show_empty_state(self, no_results=False):
         self._clear_gallery()
@@ -528,11 +552,30 @@ class MainApp(ctk.CTk):
         ).pack(expand=True, pady=80)
 
     def _display_gallery(self, matches: list, gt_basenames: set = None):
+        # Render hasil secara bertahap (paginated) — membuat card + thumbnail untuk
+        # ribuan hasil sekaligus adalah sumber utama overhead RAM setelah pencarian
+        # selesai, jadi hanya GALLERY_PAGE_SIZE pertama yang dirender di awal.
         self._clear_gallery()
+        self._gallery_matches = matches
+        self._gallery_gt_basenames = gt_basenames
         COLS = 3
         for col in range(COLS):
             self.gallery_scroll.grid_columnconfigure(col, weight=1)
-        for idx, match in enumerate(matches):
+        self._render_more_results()
+
+    def _render_more_results(self):
+        matches = self._gallery_matches
+        gt_basenames = self._gallery_gt_basenames
+        COLS = 3
+        start = self._gallery_shown
+        end = min(start + GALLERY_PAGE_SIZE, len(matches))
+
+        if self._load_more_btn is not None:
+            self._load_more_btn.destroy()
+            self._load_more_btn = None
+
+        for idx in range(start, end):
+            match = matches[idx]
             row, col = divmod(idx, COLS)
             basename = os.path.basename(match.get("file_name", ""))
             label = None
@@ -540,6 +583,20 @@ class MainApp(ctk.CTk):
                 label = "TP" if basename in gt_basenames else "FP"
             card = self._make_card(match, result_label=label)
             card.grid(row=row, column=col, padx=8, pady=8, sticky="nsew")
+
+        self._gallery_shown = end
+        if end < len(matches):
+            remaining = len(matches) - end
+            btn_row = (end - 1) // COLS + 1
+            self._load_more_btn = ctk.CTkButton(
+                self.gallery_scroll,
+                text=f"Muat lebih banyak ({remaining} tersisa)",
+                font=ctk.CTkFont("Segoe UI", 12),
+                fg_color=BG_INPUT, hover_color=C_BORDER, text_color=C_TEXT,
+                border_width=1, border_color=C_BORDER, height=36,
+                command=self._render_more_results,
+            )
+            self._load_more_btn.grid(row=btn_row, column=0, columnspan=COLS, pady=16, sticky="ew")
 
     def _make_card(self, match: dict, result_label: str = None) -> ctk.CTkFrame:
         file_path  = match.get("file_path", "")
@@ -612,16 +669,19 @@ class MainApp(ctk.CTk):
             w.bind("<Enter>", _enter)
             w.bind("<Leave>", _leave)
 
-        threading.Thread(
-            target=self._load_thumbnail, args=(file_path, img_label), daemon=True,
-        ).start()
+        self._thumb_executor.submit(self._load_thumbnail, file_path, img_label)
         return card
 
     def _load_thumbnail(self, file_path: str, label: ctk.CTkLabel):
         try:
             img = Image.open(file_path)
             img.verify()
-            img = Image.open(file_path).convert("RGB")
+            img = Image.open(file_path)
+            # Ask the JPEG decoder to decode at (roughly) the target size instead of full
+            # resolution — avoids materializing a full-size decoded array per thumbnail,
+            # which is what caused the RAM spike when a large result set is displayed.
+            img.draft("RGB", (THUMB_W * 2, THUMB_H * 2))
+            img = img.convert("RGB")
 
             iw, ih = img.size
             scale = max(THUMB_W / iw, THUMB_H / ih)
@@ -638,6 +698,64 @@ class MainApp(ctk.CTk):
             self.after(0, lambda lbl=label: lbl.configure(text="⚠", text_color=C_ERROR))
 
     # ══════════════════════════════════════════════════════════════════════════
+    #  Refresh / reset ke kondisi awal
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _refresh_window(self):
+        """
+        Menghentikan proses yang sedang berjalan (jika ada), mengembalikan seluruh
+        tampilan ke kondisi awal, dan melepas model detector/embedder dari RAM
+        (bukan hanya mereset UI) sehingga memori yang terpakai benar-benar dibebaskan.
+        """
+        if self.active_worker and self.active_worker.is_alive():
+            if not messagebox.askyesno(
+                "Proses Sedang Berjalan",
+                "Ada proses yang masih berjalan. Hentikan proses tersebut dan reset tampilan ke kondisi awal?",
+            ):
+                return
+            self.active_worker.stop()
+            self.active_worker.join(timeout=2.0)
+
+        self._timer_running = False
+        self.active_worker = None
+
+        # Reset input folder/selfie/drive
+        self.folder_path = ""
+        self.selfie_path = ""
+        self.input_mode = "local"
+        self.input_mode_seg.set("Folder Lokal")
+        self._on_input_mode_changed("Folder Lokal")
+        self.drive_entry.delete(0, "end")
+        self.folder_label.configure(text="Belum dipilih", text_color=C_MUTED)
+        self.selfie_label.configure(text="Belum dipilih", text_color=C_MUTED)
+
+        # Reset progress, status, dan timer
+        self.progress_bar.set(0)
+        self.prog_pct.configure(text="0%")
+        self.time_label.configure(text="")
+        self._set_status("Siap", C_SUBTEXT)
+        self._set_buttons_state("normal")
+
+        # Reset galeri hasil pencarian
+        self.thumbnails.clear()
+        self.result_count_label.configure(text="")
+        self._show_empty_state()
+
+        # Lepaskan model dari RAM (sesi ONNX Runtime dkk.) — akan dimuat ulang otomatis
+        # secara lazy oleh _ensure_models() saat pengguna memulai indexing/pencarian berikutnya
+        self.detector = None
+        self.embedder = None
+        self.engine_badge.configure(text="● SCRFD + ArcFace  |  OFFLINE", text_color="#15803D")
+
+        self._index_timings = {}
+
+        # Paksa garbage collection agar objek besar (model, embedding, thumbnail) yang
+        # baru dilepas referensinya benar-benar dibebaskan oleh Python secepatnya
+        gc.collect()
+
+        logger.info("Jendela aplikasi di-refresh: state direset dan model dilepas dari RAM.")
+
+    # ══════════════════════════════════════════════════════════════════════════
     #  Safe close
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -645,4 +763,5 @@ class MainApp(ctk.CTk):
         self._timer_running = False
         if self.active_worker and self.active_worker.is_alive():
             self.active_worker.stop()
+        self._thumb_executor.shutdown(wait=False, cancel_futures=True)
         self.destroy()

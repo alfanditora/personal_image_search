@@ -3,7 +3,6 @@ import time
 import cv2
 import logging
 import numpy as np
-from mtcnn import MTCNN
 
 # Set logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -21,6 +20,10 @@ class FaceDetector:
         if self.detector_type == "mtcnn":
             logger.info("Menginisialisasi detektor wajah MTCNN...")
             try:
+                # Import lokal (bukan di top-level modul): paket 'mtcnn' memuat TensorFlow/Keras,
+                # yang berat secara memori (~ratusan MB - 1GB+). SCRFD adalah default di seluruh
+                # aplikasi, jadi TensorFlow hanya perlu dimuat kalau MTCNN benar-benar dipilih.
+                from mtcnn import MTCNN
                 self.detector = MTCNN()
                 logger.info("Detektor wajah MTCNN berhasil diinisialisasi.")
             except Exception as e:
