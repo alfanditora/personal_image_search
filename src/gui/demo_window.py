@@ -16,25 +16,27 @@ TN and Accuracy always use the GT image count as the denominator (exact; no fold
 import os
 import json
 import logging
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, Canvas
 import customtkinter as ctk
 
 from gui.main_window import (
     MainApp,
-    BG_MAIN, BG_SIDEBAR, BG_CARD, BG_CARD_HV, BG_INPUT,
-    C_ACCENT, C_ACCENT_HV, C_SUCCESS, C_SUCCESS_HV,
+    BG_MAIN, BG_SIDEBAR, BG_CARD, BG_CARD_HV, BG_INPUT, BG_INPUT_HV, BG_TRACK,
+    C_ACCENT, C_ACCENT_HV, C_ACCENT_TX, C_INK, C_INK_HV, C_SUCCESS, C_SUCCESS_HV,
     C_ERROR, C_WARNING, C_TEXT, C_SUBTEXT, C_MUTED,
-    C_BORDER, C_HDR_BG,
+    C_BORDER, C_HDR_BG, FONT_BODY, FONT_TITLE,
     THUMB_W, THUMB_H,
 )
 
 logger = logging.getLogger(__name__)
 
-C_REPORT_BG = "#F0F9FF"
-C_TP_BG     = "#DCFCE7"
-C_FP_BG     = "#FEE2E2"
-C_FN_BG     = "#FEF9C3"
-C_TN_BG     = "#F1F5F9"
+# ── Report panel — warm-neutral tints (Claude-inspired palette) ────────────────
+C_REPORT_BG   = "#F5F1E8"
+C_TP_BG, C_TP_FG = "#E7EFE2", "#4B6B45"
+C_FP_BG, C_FP_FG = "#F5E1DA", "#9C4A3A"
+C_FN_BG, C_FN_FG = "#F7EEDA", "#8A6A22"
+C_TN_BG, C_TN_FG = "#ECEAE0", "#6B6960"
+C_DETECT_BG, C_DETECT_FG = "#E8ECF2", "#40597A"
 
 # Maps display label → JSON key used in multi-person GT
 PERSON_KEY_MAP = {
@@ -52,6 +54,8 @@ class DemoApp(MainApp):
         self._ground_truth      = None   # flat format: {basename: bool}
         self._ground_truth_raw  = None   # multi-person: {basename: {person_key: bool}}
         self._report_frame      = None
+        self._report_body       = None
+        self._report_collapsed  = False
         self._query_person      = None   # StringVar — created in _build_sidebar after Tk root
         super().__init__()
         self.title("Personal Image Search — Demo")
@@ -63,27 +67,29 @@ class DemoApp(MainApp):
         hdr.pack(fill="x", side="top")
         hdr.pack_propagate(False)
 
+        ctk.CTkFrame(self, height=1, fg_color=C_BORDER, corner_radius=0).pack(fill="x", side="top")
+
         title_frame = ctk.CTkFrame(hdr, fg_color="transparent")
         title_frame.pack(side="left", padx=24, pady=10)
 
         ctk.CTkLabel(
             title_frame, text="Personal Image Search",
-            font=ctk.CTkFont("Segoe UI", 17, "bold"),
-            text_color="#0F172A",
+            font=ctk.CTkFont(FONT_TITLE, 19, "bold"),
+            text_color="#29261B",
         ).pack(side="left")
 
         ctk.CTkLabel(
             title_frame, text="  DEMO",
-            font=ctk.CTkFont("Segoe UI", 11, "bold"),
-            text_color="#1E40AF",
-            fg_color="#DBEAFE",
+            font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+            text_color=C_ACCENT_TX,
+            fg_color="#F5E4DE",
             corner_radius=4,
         ).pack(side="left", padx=(8, 0))
 
         self.engine_badge = ctk.CTkLabel(
-            hdr, text="● SCRFD + ArcFace  |  OFFLINE",
-            font=ctk.CTkFont("Segoe UI", 11, "bold"),
-            text_color="#15803D",
+            hdr, text="●  SCRFD + ArcFace  |  OFFLINE",
+            font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+            text_color=C_MUTED,
         )
         self.engine_badge.pack(side="right", padx=24)
 
@@ -96,15 +102,16 @@ class DemoApp(MainApp):
         self._threshold    = ctk.DoubleVar(value=0.60)
         self._query_person = ctk.StringVar(value="A")
 
-        wrapper = ctk.CTkFrame(parent, width=500, fg_color=C_BORDER, corner_radius=0)
+        wrapper = ctk.CTkFrame(parent, width=300, fg_color=C_BORDER, corner_radius=0)
         wrapper.grid(row=0, column=0, sticky="nsew")
         wrapper.grid_propagate(False)
+        wrapper.pack_propagate(False)
 
         sb = ctk.CTkScrollableFrame(
             wrapper, fg_color=BG_SIDEBAR, corner_radius=0,
             scrollbar_button_color=C_BORDER,
             scrollbar_button_hover_color=C_MUTED,
-            scrollbar_fg_color=BG_INPUT,
+            scrollbar_fg_color=BG_SIDEBAR,
         )
         sb.pack(fill="both", expand=True, padx=(0, 1))
         sb.grid_columnconfigure(0, weight=1)
@@ -117,9 +124,11 @@ class DemoApp(MainApp):
 
         self.input_mode_seg = ctk.CTkSegmentedButton(
             sb, values=["Folder Lokal", "Google Drive"],
-            font=ctk.CTkFont("Segoe UI", 11),
-            fg_color=BG_INPUT, selected_color=C_ACCENT, selected_hover_color=C_ACCENT_HV,
-            unselected_color=BG_INPUT, unselected_hover_color=C_BORDER,
+            font=ctk.CTkFont(FONT_BODY, 11),
+            fg_color=BG_TRACK,
+            selected_color=BG_CARD, selected_hover_color=BG_CARD,
+            unselected_color=BG_TRACK, unselected_hover_color="#DEDCD1",
+            text_color=C_TEXT,
             command=self._on_input_mode_changed,
         )
         self.input_mode_seg.set("Folder Lokal")
@@ -132,17 +141,13 @@ class DemoApp(MainApp):
         self.local_input_frame.grid(row=input_row, column=0, sticky="ew", padx=0, pady=0)
         self.local_input_frame.grid_columnconfigure(0, weight=1)
 
-        self.folder_label = ctk.CTkLabel(
-            self.local_input_frame, text="Belum dipilih",
-            font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED,
-            anchor="w", wraplength=456,
-        )
-        self.folder_label.grid(row=0, column=0, sticky="ew", padx=16, pady=(0, 6))
+        self._build_folder_card(self.local_input_frame).grid(
+            row=0, column=0, sticky="ew", padx=16, pady=(0, 8))
 
         ctk.CTkButton(
             self.local_input_frame, text="Pilih Folder",
-            font=ctk.CTkFont("Segoe UI", 12),
-            fg_color=BG_INPUT, hover_color=C_BORDER, text_color=C_TEXT,
+            font=ctk.CTkFont(FONT_BODY, 12),
+            fg_color=BG_INPUT, hover_color=BG_INPUT_HV, text_color=C_TEXT,
             height=36, corner_radius=8, border_width=1, border_color=C_BORDER,
             command=self._select_folder,
         ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 6))
@@ -153,8 +158,9 @@ class DemoApp(MainApp):
 
         self.drive_entry = ctk.CTkEntry(
             self.drive_input_frame, placeholder_text="Tempel tautan folder Google Drive...",
-            font=ctk.CTkFont("Segoe UI", 11),
+            font=ctk.CTkFont(FONT_BODY, 11),
             fg_color=BG_INPUT, border_color=C_BORDER, text_color=C_TEXT,
+            placeholder_text_color=C_MUTED,
             height=36, corner_radius=8,
         )
         self.drive_entry.grid(row=0, column=0, sticky="ew", padx=16, pady=(0, 6))
@@ -162,15 +168,15 @@ class DemoApp(MainApp):
         ctk.CTkLabel(
             self.drive_input_frame,
             text="Cache & hasil pencarian akan disimpan di folder Drive ini juga.",
-            font=ctk.CTkFont("Segoe UI", 10), text_color=C_MUTED,
-            anchor="w", wraplength=456, justify="left",
+            font=ctk.CTkFont(FONT_BODY, 10), text_color=C_MUTED,
+            anchor="w", wraplength=716, justify="left",
         ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 6))
 
         self.drive_input_frame.grid_remove()  # tersembunyi selama mode lokal aktif
 
         self.btn_index = ctk.CTkButton(
             sb, text="Indeks Foto",
-            font=ctk.CTkFont("Segoe UI", 12, "bold"),
+            font=ctk.CTkFont(FONT_BODY, 12, "bold"),
             fg_color=C_ACCENT, hover_color=C_ACCENT_HV, text_color="#FFFFFF",
             height=36, corner_radius=8,
             command=self._start_indexing,
@@ -185,23 +191,23 @@ class DemoApp(MainApp):
 
         self.selfie_label = ctk.CTkLabel(
             sb, text="Belum dipilih",
-            font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED,
-            anchor="w", wraplength=456,
+            font=ctk.CTkFont(FONT_BODY, 11), text_color=C_MUTED,
+            anchor="w", wraplength=716,
         )
         self.selfie_label.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 6)); r += 1
 
         ctk.CTkButton(
             sb, text="Pilih Selfie",
-            font=ctk.CTkFont("Segoe UI", 12),
-            fg_color=BG_INPUT, hover_color=C_BORDER, text_color=C_TEXT,
+            font=ctk.CTkFont(FONT_BODY, 12),
+            fg_color=BG_INPUT, hover_color=BG_INPUT_HV, text_color=C_TEXT,
             height=36, corner_radius=8, border_width=1, border_color=C_BORDER,
             command=self._select_selfie,
         ).grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 6)); r += 1
 
         self.btn_search = ctk.CTkButton(
             sb, text="Cari Foto",
-            font=ctk.CTkFont("Segoe UI", 13, "bold"),
-            fg_color=C_SUCCESS, hover_color=C_SUCCESS_HV, text_color="#FFFFFF",
+            font=ctk.CTkFont(FONT_BODY, 13, "bold"),
+            fg_color=C_INK, hover_color=C_INK_HV, text_color=BG_MAIN,
             height=40, corner_radius=8,
             command=self._start_search,
         )
@@ -215,15 +221,15 @@ class DemoApp(MainApp):
 
         self._gt_status_label = ctk.CTkLabel(
             sb, text="Belum dimuat",
-            font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED,
-            anchor="w", wraplength=456, fg_color=BG_SIDEBAR,
+            font=ctk.CTkFont(FONT_BODY, 11), text_color=C_MUTED,
+            anchor="w", wraplength=716, fg_color=BG_SIDEBAR,
         )
         self._gt_status_label.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 6)); r += 1
 
         ctk.CTkButton(
             sb, text="Pilih File Ground Truth",
-            font=ctk.CTkFont("Segoe UI", 12),
-            fg_color=BG_INPUT, hover_color=C_BORDER, text_color=C_TEXT,
+            font=ctk.CTkFont(FONT_BODY, 12),
+            fg_color=BG_INPUT, hover_color=BG_INPUT_HV, text_color=C_TEXT,
             height=36, corner_radius=8, border_width=1, border_color=C_BORDER,
             command=self._select_ground_truth,
         ).grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 12)); r += 1
@@ -236,13 +242,13 @@ class DemoApp(MainApp):
             sb,
             values=["A", "B", "C"],
             variable=self._query_person,
-            fg_color=BG_INPUT,
+            fg_color=BG_TRACK,
             selected_color=C_ACCENT,
             selected_hover_color=C_ACCENT_HV,
-            unselected_color=BG_INPUT,
-            unselected_hover_color=C_BORDER,
+            unselected_color=BG_TRACK,
+            unselected_hover_color="#DEDCD1",
             text_color=C_TEXT,
-            font=ctk.CTkFont("Segoe UI", 12, "bold"),
+            font=ctk.CTkFont(FONT_BODY, 12, "bold"),
             state="disabled",
         )
         self._person_btn.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 20)); r += 1
@@ -256,7 +262,7 @@ class DemoApp(MainApp):
         self._section_label(trow, "THRESHOLD KEMIRIPAN").grid(row=0, column=0, sticky="w")
         self.thresh_val_label = ctk.CTkLabel(
             trow, text="0.60",
-            font=ctk.CTkFont("Segoe UI", 12, "bold"), text_color=C_ACCENT,
+            font=ctk.CTkFont(FONT_BODY, 12, "bold"), text_color=C_ACCENT_TX,
             fg_color=BG_SIDEBAR,
         )
         self.thresh_val_label.grid(row=0, column=1, sticky="e")
@@ -264,7 +270,7 @@ class DemoApp(MainApp):
         ctk.CTkSlider(
             sb, from_=0.10, to=1.00, number_of_steps=18,
             variable=self._threshold,
-            fg_color=C_BORDER,
+            fg_color=BG_TRACK,
             button_color=C_ACCENT, button_hover_color=C_ACCENT_HV,
             progress_color=C_ACCENT,
             command=self._on_threshold_change,
@@ -279,14 +285,14 @@ class DemoApp(MainApp):
         self._section_label(prow, "PROGRES").grid(row=0, column=0, sticky="w")
         self.prog_pct = ctk.CTkLabel(
             prow, text="0%",
-            font=ctk.CTkFont("Segoe UI", 10, "bold"), text_color=C_ACCENT,
+            font=ctk.CTkFont(FONT_BODY, 10, "bold"), text_color=C_ACCENT_TX,
             fg_color=BG_SIDEBAR,
         )
         self.prog_pct.grid(row=0, column=1, sticky="e")
 
         self.progress_bar = ctk.CTkProgressBar(
             sb, mode="determinate",
-            progress_color=C_ACCENT, fg_color=C_BORDER,
+            progress_color=C_ACCENT, fg_color=BG_TRACK,
             height=6, corner_radius=3,
         )
         self.progress_bar.set(0)
@@ -294,14 +300,14 @@ class DemoApp(MainApp):
 
         self.status_label = ctk.CTkLabel(
             sb, text="Siap",
-            font=ctk.CTkFont("Segoe UI", 11), text_color=C_SUBTEXT,
-            anchor="w", wraplength=456, fg_color=BG_SIDEBAR,
+            font=ctk.CTkFont(FONT_BODY, 11), text_color=C_SUBTEXT,
+            anchor="w", wraplength=716, fg_color=BG_SIDEBAR,
         )
         self.status_label.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 4)); r += 1
 
         self.time_label = ctk.CTkLabel(
             sb, text="",
-            font=ctk.CTkFont("Segoe UI", 10), text_color=C_MUTED,
+            font=ctk.CTkFont(FONT_BODY, 10), text_color=C_MUTED,
             anchor="w", fg_color=BG_SIDEBAR,
         )
         self.time_label.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 24))
@@ -320,19 +326,19 @@ class DemoApp(MainApp):
         hdr_row.grid_propagate(False)
 
         ctk.CTkLabel(
-            hdr_row, text="HASIL PENCARIAN",
-            font=ctk.CTkFont("Segoe UI", 12, "bold"), text_color=C_SUBTEXT, anchor="w",
+            hdr_row, text="Hasil Pencarian",
+            font=ctk.CTkFont(FONT_TITLE, 15, "bold"), text_color="#29261B", anchor="w",
         ).grid(row=0, column=0, sticky="w")
 
         self.result_count_label = ctk.CTkLabel(
             hdr_row, text="",
-            font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED,
+            font=ctk.CTkFont(FONT_BODY, 11), text_color=C_MUTED,
         )
         self.result_count_label.grid(row=0, column=1, sticky="e")
 
         # Report panel (row=1, hidden until metrics are ready)
         self._report_frame = ctk.CTkFrame(
-            self._gal_frame, fg_color=C_REPORT_BG, corner_radius=10,
+            self._gal_frame, fg_color=BG_CARD, corner_radius=12,
             border_width=1, border_color=C_BORDER,
         )
 
@@ -340,7 +346,7 @@ class DemoApp(MainApp):
             self._gal_frame, fg_color=BG_MAIN,
             scrollbar_button_color=C_BORDER,
             scrollbar_button_hover_color=C_MUTED,
-            scrollbar_fg_color=BG_INPUT,
+            scrollbar_fg_color=BG_MAIN,
         )
         self.gallery_scroll.grid(row=2, column=0, sticky="nsew", padx=(20, 8), pady=(8, 16))
 
@@ -392,7 +398,7 @@ class DemoApp(MainApp):
         self._set_buttons_state("disabled")
         self.progress_bar.set(0)
         self.prog_pct.configure(text="")
-        self._set_status("Menganalisis selfie...", C_ACCENT)
+        self._set_status("Menganalisis selfie...", C_ACCENT_TX)
         self._show_empty_state()
         self.result_count_label.configure(text="")
         self.thumbnails.clear()
@@ -585,94 +591,140 @@ class DemoApp(MainApp):
         for w in self._report_frame.winfo_children():
             w.destroy()
 
-        # ── Header ────────────────────────────────────────────────────────────
-        hdr_row = ctk.CTkFrame(self._report_frame, fg_color=C_REPORT_BG)
-        hdr_row.pack(fill="x", padx=16, pady=(12, 8))
-        hdr_row.grid_columnconfigure(0, weight=1)
+        # ── Header: icon + title + person pill ────────────────────────────────
+        hdr_row = ctk.CTkFrame(self._report_frame, fg_color=BG_CARD)
+        hdr_row.pack(fill="x", padx=20, pady=(18, 14))
+        hdr_row.grid_columnconfigure(1, weight=1)
 
-        title = "LAPORAN EVALUASI"
-        if person_label:
-            title += f"  —  {person_label}"
+        icon_bg = ctk.CTkFrame(hdr_row, width=36, height=36, corner_radius=9, fg_color="#F5E4DE")
+        icon_bg.grid(row=0, column=0, rowspan=2, padx=(0, 12))
+        icon_bg.grid_propagate(False)
+        icon = Canvas(icon_bg, width=18, height=18, bg="#F5E4DE", highlightthickness=0, bd=0)
+        icon.place(relx=0.5, rely=0.5, anchor="center")
+        icon.create_line(3, 2, 3, 16, 17, 16, fill=C_ACCENT_TX, width=1.6, capstyle="round", joinstyle="round")
+        icon.create_line(6, 13, 9, 8, 12, 10, 16, 4, fill=C_ACCENT_TX, width=1.6, capstyle="round", joinstyle="round")
+
         ctk.CTkLabel(
-            hdr_row, text=title,
-            font=ctk.CTkFont("Segoe UI", 10, "bold"), text_color=C_SUBTEXT,
-            fg_color=C_REPORT_BG, anchor="w",
-        ).grid(row=0, column=0, sticky="w")
+            hdr_row, text="Laporan Evaluasi",
+            font=ctk.CTkFont(FONT_TITLE, 15, "bold"), text_color=C_TEXT,
+            fg_color=BG_CARD, anchor="w",
+        ).grid(row=0, column=1, sticky="w")
 
+        subtitle = ""
         if total_images is not None and positive_count is not None:
+            subtitle = f"{positive_count} positif dari {total_images} gambar diverifikasi"
+        ctk.CTkLabel(
+            hdr_row, text=subtitle,
+            font=ctk.CTkFont(FONT_BODY, 11), text_color=C_MUTED,
+            fg_color=BG_CARD, anchor="w",
+        ).grid(row=1, column=1, sticky="w")
+
+        if person_label:
             ctk.CTkLabel(
-                hdr_row,
-                text=f"{positive_count} positif dari {total_images} gambar",
-                font=ctk.CTkFont("Segoe UI", 9), text_color=C_MUTED,
-                fg_color=C_REPORT_BG,
-            ).grid(row=0, column=1, sticky="e")
+                hdr_row, text=f"  {person_label}  ",
+                font=ctk.CTkFont(FONT_BODY, 11, "bold"), text_color=C_ACCENT_TX,
+                fg_color="#F5E4DE", corner_radius=20,
+            ).grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 0))
+
+        self._report_toggle_btn = ctk.CTkButton(
+            hdr_row, text="▲ Sembunyikan Detail",
+            font=ctk.CTkFont(FONT_BODY, 10, "bold"),
+            fg_color=BG_INPUT, hover_color=BG_INPUT_HV, text_color=C_SUBTEXT,
+            border_width=1, border_color=C_BORDER,
+            width=168, height=26, corner_radius=6,
+            command=self._toggle_report,
+        )
+        self._report_toggle_btn.grid(row=0, column=3, rowspan=2, sticky="e", padx=(12, 0))
+
+        # ── Body: detection tile + confusion matrix + metrics + timing ─────────
+        self._report_body = ctk.CTkFrame(self._report_frame, fg_color=BG_CARD)
 
         # ── Wajah terdeteksi (face detection) ───────────────────────────────────
         if faces_detected is not None:
-            det_row = ctk.CTkFrame(self._report_frame, fg_color=C_REPORT_BG)
-            det_row.pack(fill="x", padx=16, pady=(0, 8))
-            det_tile = ctk.CTkFrame(det_row, fg_color="#EEF2FF", corner_radius=8,
-                                     border_width=1, border_color=C_BORDER)
-            det_tile.pack(fill="x")
+            det_tile = ctk.CTkFrame(
+                self._report_body, fg_color=C_DETECT_BG, corner_radius=9,
+                border_width=1, border_color="#DCE4EA",
+            )
+            det_tile.pack(fill="x", padx=20, pady=(0, 16))
             ctk.CTkLabel(
                 det_tile, text=str(faces_detected),
-                font=ctk.CTkFont("Segoe UI", 16, "bold"), text_color="#4338CA",
-                fg_color="#EEF2FF",
-            ).pack(side="left", padx=(16, 8), pady=8)
+                font=ctk.CTkFont(FONT_TITLE, 18, "bold"), text_color=C_DETECT_FG,
+                fg_color=C_DETECT_BG,
+            ).pack(side="left", padx=(16, 12), pady=10)
+            ctk.CTkFrame(det_tile, width=1, height=22, fg_color="#DCE4EA").pack(side="left", pady=10)
             ctk.CTkLabel(
-                det_tile, text="wajah terdeteksi oleh face detection (total cache saat ini)",
-                font=ctk.CTkFont("Segoe UI", 10), text_color=C_SUBTEXT,
-                fg_color="#EEF2FF",
-            ).pack(side="left", pady=8)
+                det_tile, text="wajah terdeteksi oleh face detection\n(total cache saat ini)",
+                font=ctk.CTkFont(FONT_BODY, 10), text_color=C_SUBTEXT,
+                fg_color=C_DETECT_BG, justify="left", anchor="w",
+            ).pack(side="left", padx=(12, 16), pady=10)
 
-        # ── Confusion counts ──────────────────────────────────────────────────
-        counts_row = ctk.CTkFrame(self._report_frame, fg_color=C_REPORT_BG)
-        counts_row.pack(fill="x", padx=16, pady=(0, 8))
+        # ── Confusion matrix ──────────────────────────────────────────────────
+        ctk.CTkLabel(
+            self._report_body, text="MATRIKS KONFUSI",
+            font=ctk.CTkFont(FONT_BODY, 9, "bold"), text_color=C_MUTED,
+            fg_color=BG_CARD, anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 6))
 
-        for label, value, bg in [
-            ("True Positive",  tp, C_TP_BG),
-            ("False Positive", fp, C_FP_BG),
-            ("False Negative", fn, C_FN_BG),
-            ("True Negative",  tn, C_TN_BG),
+        counts_row = ctk.CTkFrame(self._report_body, fg_color=BG_CARD)
+        counts_row.pack(fill="x", padx=20, pady=(0, 16))
+
+        for label, value, bg, fg in [
+            ("True Positive",  tp, C_TP_BG, C_TP_FG),
+            ("False Positive", fp, C_FP_BG, C_FP_FG),
+            ("False Negative", fn, C_FN_BG, C_FN_FG),
+            ("True Negative",  tn, C_TN_BG, C_TN_FG),
         ]:
-            tile = ctk.CTkFrame(counts_row, fg_color=bg, corner_radius=8)
+            tile = ctk.CTkFrame(counts_row, fg_color=bg, corner_radius=9)
             tile.pack(side="left", expand=True, fill="x", padx=4)
+            ctk.CTkFrame(tile, height=3, fg_color=fg, corner_radius=0).pack(fill="x", side="top")
             ctk.CTkLabel(
                 tile, text=str(value),
-                font=ctk.CTkFont("Segoe UI", 20, "bold"), text_color=C_TEXT,
+                font=ctk.CTkFont(FONT_TITLE, 21, "bold"), text_color=fg,
                 fg_color=bg,
-            ).pack(pady=(8, 0))
+            ).pack(pady=(9, 0))
             ctk.CTkLabel(
                 tile, text=label,
-                font=ctk.CTkFont("Segoe UI", 9), text_color=C_SUBTEXT,
+                font=ctk.CTkFont(FONT_BODY, 9, "bold"), text_color=C_SUBTEXT,
                 fg_color=bg,
-            ).pack(pady=(0, 8))
+            ).pack(pady=(2, 10))
 
         # ── Metrics ───────────────────────────────────────────────────────────
-        metrics_row = ctk.CTkFrame(self._report_frame, fg_color=C_REPORT_BG)
-        metrics_row.pack(fill="x", padx=16, pady=(0, 8))
+        ctk.CTkLabel(
+            self._report_body, text="METRIK PERFORMA",
+            font=ctk.CTkFont(FONT_BODY, 9, "bold"), text_color=C_MUTED,
+            fg_color=BG_CARD, anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 6))
+
+        metrics_row = ctk.CTkFrame(self._report_body, fg_color=BG_CARD)
+        metrics_row.pack(fill="x", padx=20, pady=(0, 16))
 
         metrics = [
-            ("Precision",    f"{precision:.3f}", C_SUCCESS if precision >= 0.7 else C_WARNING),
-            ("Recall",       f"{recall:.3f}",    C_SUCCESS if recall    >= 0.7 else C_WARNING),
-            ("F1-Score",     f"{f1:.3f}",        C_SUCCESS if f1        >= 0.7 else C_WARNING),
-            ("Accuracy",     f"{accuracy:.3f}",  C_SUCCESS if accuracy  >= 0.8 else C_WARNING),
+            ("Precision", precision, C_SUCCESS if precision >= 0.7 else C_WARNING),
+            ("Recall",    recall,    C_SUCCESS if recall    >= 0.7 else C_WARNING),
+            ("F1-Score",  f1,        C_SUCCESS if f1        >= 0.7 else C_WARNING),
+            ("Accuracy",  accuracy,  C_SUCCESS if accuracy  >= 0.8 else C_WARNING),
         ]
 
-        for name, val, color in metrics:
-            tile = ctk.CTkFrame(metrics_row, fg_color=BG_CARD, corner_radius=8,
+        for name, value, color in metrics:
+            tile = ctk.CTkFrame(metrics_row, fg_color=BG_CARD, corner_radius=9,
                                 border_width=1, border_color=C_BORDER)
             tile.pack(side="left", expand=True, fill="x", padx=4)
             ctk.CTkLabel(
-                tile, text=val,
-                font=ctk.CTkFont("Segoe UI", 16, "bold"), text_color=color,
+                tile, text=f"{value:.3f}",
+                font=ctk.CTkFont(FONT_TITLE, 17, "bold"), text_color=color,
                 fg_color=BG_CARD,
-            ).pack(pady=(8, 0))
+            ).pack(pady=(10, 0))
             ctk.CTkLabel(
                 tile, text=name,
-                font=ctk.CTkFont("Segoe UI", 9), text_color=C_SUBTEXT,
+                font=ctk.CTkFont(FONT_BODY, 9, "bold"), text_color=C_SUBTEXT,
                 fg_color=BG_CARD,
-            ).pack(pady=(0, 8))
+            ).pack(pady=(2, 7))
+            prog = ctk.CTkProgressBar(
+                tile, height=4, corner_radius=2,
+                fg_color="#ECEAE0", progress_color=color,
+            )
+            prog.set(max(0.0, min(1.0, value)))
+            prog.pack(fill="x", padx=12, pady=(0, 10))
 
         # ── Timing ────────────────────────────────────────────────────────────
         timings = getattr(self, "_index_timings", {})
@@ -685,29 +737,48 @@ class DemoApp(MainApp):
         align_t = timings.get("alignment", 0.0)
         emb_t   = timings.get("embedding", 0.0)
 
-        timing_row = ctk.CTkFrame(self._report_frame, fg_color=C_REPORT_BG)
-        timing_row.pack(fill="x", padx=16, pady=(0, 12))
+        ctk.CTkLabel(
+            self._report_body, text="WAKTU PROSES",
+            font=ctk.CTkFont(FONT_BODY, 9, "bold"), text_color=C_MUTED,
+            fg_color=BG_CARD, anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 6))
+
+        timing_row = ctk.CTkFrame(self._report_body, fg_color=BG_CARD)
+        timing_row.pack(fill="x", padx=20, pady=(0, 18))
 
         timing_tiles = [
-            ("Total Indeksasi", _fmt(det_t + align_t + emb_t), "#EFF6FF", "#1D4ED8"),
-            ("Waktu Pencarian", _fmt(self._elapsed),             "#F0FDF4", "#15803D"),
+            ("Total Indeksasi", _fmt(det_t + align_t + emb_t), C_DETECT_BG, C_DETECT_FG),
+            ("Waktu Pencarian", _fmt(self._elapsed),             C_TP_BG, C_TP_FG),
         ]
         if drive_sync_time > 0:
-            timing_tiles.append(("Sinkronisasi Drive", _fmt(drive_sync_time), "#FEF3C7", "#B45309"))
+            timing_tiles.append(("Sinkronisasi Drive", _fmt(drive_sync_time), C_FN_BG, C_FN_FG))
 
         for name, val, bg, fg in timing_tiles:
-            tile = ctk.CTkFrame(timing_row, fg_color=bg, corner_radius=8,
+            tile = ctk.CTkFrame(timing_row, fg_color=bg, corner_radius=9,
                                 border_width=1, border_color=C_BORDER)
             tile.pack(side="left", expand=True, fill="x", padx=4)
             ctk.CTkLabel(
                 tile, text=val,
-                font=ctk.CTkFont("Segoe UI", 14, "bold"), text_color=fg,
+                font=ctk.CTkFont(FONT_TITLE, 14, "bold"), text_color=fg,
                 fg_color=bg,
-            ).pack(pady=(8, 0))
+            ).pack(pady=(9, 0))
             ctk.CTkLabel(
                 tile, text=name,
-                font=ctk.CTkFont("Segoe UI", 9), text_color=C_SUBTEXT,
+                font=ctk.CTkFont(FONT_BODY, 9, "bold"), text_color=C_SUBTEXT,
                 fg_color=bg,
-            ).pack(pady=(0, 8))
+            ).pack(pady=(2, 9))
 
+        self._apply_report_collapsed_state()
         self._report_frame.grid(row=1, column=0, sticky="ew", padx=20, pady=(8, 0))
+
+    def _toggle_report(self):
+        self._report_collapsed = not self._report_collapsed
+        self._apply_report_collapsed_state()
+
+    def _apply_report_collapsed_state(self):
+        if self._report_collapsed:
+            self._report_body.pack_forget()
+            self._report_toggle_btn.configure(text="▼ Tampilkan Detail")
+        else:
+            self._report_body.pack(fill="x", side="top")
+            self._report_toggle_btn.configure(text="▲ Sembunyikan Detail")
