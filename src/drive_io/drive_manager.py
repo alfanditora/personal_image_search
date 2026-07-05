@@ -1,11 +1,14 @@
-import io
 import os
 import re
 import logging
+import threading
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import httplib2
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
@@ -27,6 +30,22 @@ _CREDENTIALS_PATH = _PROJECT_ROOT / "models" / "credentials.json"
 _TOKEN_PATH = _PROJECT_ROOT / "models" / "token.json"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+# Both cache-file uploads and result-photo copies are many small, independent, blocking
+# Drive API calls (one network round-trip each) — sequentially that's the real bottleneck,
+# not the API quota. A small worker pool overlaps those round-trips; num_retries absorbs
+# transient rate-limit/backoff errors (403/429/5xx) via googleapiclient's exponential backoff.
+DRIVE_POOL_WORKERS = 8
+# Submitted in bounded batches rather than all at once, so a huge cache folder or a huge
+# match count doesn't queue thousands of Future/work-item objects in RAM at the same time.
+DRIVE_BATCH_SIZE = 200
+_API_NUM_RETRIES = 5
+
+# Photos, unlike the tiny cache JSON, can be several MB each — downloads stream straight to
+# disk in chunks of this size (see _download_file) instead of buffering a whole file in RAM,
+# so peak memory across DRIVE_POOL_WORKERS concurrent downloads stays bounded (~a few tens of MB)
+# regardless of photo size.
+DRIVE_DOWNLOAD_CHUNK_SIZE = 5 * 1024 * 1024
 
 _FOLDER_LINK_RE = re.compile(r"/folders/([a-zA-Z0-9_-]+)")
 
@@ -50,7 +69,9 @@ class DriveManager:
             raise ValueError("Tautan/ID folder Google Drive tidak boleh kosong.")
 
         self.root_folder_id = self._extract_folder_id(folder_link_or_id)
+        self._credentials = None  # diisi oleh _authenticate(), dipakai ulang untuk http per-thread
         self.service = self._authenticate()
+        self._thread_local = threading.local()
 
         # Peta relative_path -> file_id, diisi oleh list_images().
         self._image_map: dict[str, str] = {}
@@ -98,7 +119,49 @@ class DriveManager:
             _TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
             logger.info(f"Token autentikasi Google Drive disimpan di: {_TOKEN_PATH}")
 
+        self._credentials = creds
         return build("drive", "v3", credentials=creds)
+
+    def _thread_http(self):
+        """
+        Objek http terotorisasi khusus thread yang sedang berjalan.
+
+        self.service tidak thread-safe untuk dipakai bersamaan dari banyak thread
+        (googleapiclient berbagi satu koneksi http internal per service). Agar upload
+        cache bisa dijalankan konkuren, tiap worker thread memakai httplib2.Http()
+        miliknya sendiri, tetap terotorisasi dengan credentials yang sama, dan
+        dioper ke execute(http=...) alih-alih memakai http bawaan service.
+        """
+        if not hasattr(self._thread_local, "http"):
+            self._thread_local.http = AuthorizedHttp(self._credentials, http=httplib2.Http())
+        return self._thread_local.http
+
+    def _run_in_pool(self, items: list, work_fn, label_fn, thread_name_prefix: str) -> tuple[int, list]:
+        """
+        Menjalankan work_fn(item) untuk tiap item di 'items' memakai worker pool tetap
+        (DRIVE_POOL_WORKERS), disubmit dalam batch terbatas (DRIVE_BATCH_SIZE) alih-alih
+        sekaligus semua — supaya daftar kerja yang sangat besar tidak menumpuk ribuan
+        objek Future/work-item di RAM secara bersamaan.
+
+        Returns:
+            tuple[int, list]: (jumlah sukses, daftar label item yang gagal via label_fn).
+        """
+        succeeded = 0
+        failed = []
+        with ThreadPoolExecutor(max_workers=DRIVE_POOL_WORKERS, thread_name_prefix=thread_name_prefix) as pool:
+            for batch_start in range(0, len(items), DRIVE_BATCH_SIZE):
+                batch = items[batch_start:batch_start + DRIVE_BATCH_SIZE]
+                futures = {pool.submit(work_fn, item): item for item in batch}
+                for future in as_completed(futures):
+                    item = futures[future]
+                    try:
+                        future.result()
+                        succeeded += 1
+                    except Exception as e:
+                        label = label_fn(item)
+                        failed.append(label)
+                        logger.error(f"Gagal memproses '{label}': {str(e)}")
+        return succeeded, failed
 
     def _list_children(self, parent_id: str, extra_query: str = "") -> list[dict]:
         """Mengambil seluruh child (file/folder) langsung dari sebuah folder Drive, dengan paginasi."""
@@ -114,7 +177,7 @@ class DriveManager:
                 fields="nextPageToken, files(id, name, mimeType)",
                 pageToken=page_token,
                 pageSize=1000,
-            ).execute()
+            ).execute(num_retries=_API_NUM_RETRIES)
             files.extend(response.get("files", []))
             page_token = response.get("nextPageToken")
             if not page_token:
@@ -134,7 +197,7 @@ class DriveManager:
             return folder_id
 
         metadata = {"name": name, "mimeType": _FOLDER_MIME_TYPE, "parents": [parent_id]}
-        created = self.service.files().create(body=metadata, fields="id").execute()
+        created = self.service.files().create(body=metadata, fields="id").execute(num_retries=_API_NUM_RETRIES)
         logger.info(f"Membuat folder '{name}' baru di Drive.")
         return created["id"]
 
@@ -183,12 +246,22 @@ class DriveManager:
         local_root.mkdir(parents=True, exist_ok=True)
         self.list_images()
 
+        image_jobs = []
         for rel_path, file_id in self._image_map.items():
             dst = local_root / rel_path
             if dst.exists():
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
-            self._download_file(file_id, dst)
+            image_jobs.append((file_id, dst))
+
+        if image_jobs:
+            downloaded, failed = self._run_in_pool(
+                image_jobs, self._download_job, lambda job: job[1].name, "drive-download",
+            )
+            msg = f"Mengunduh {downloaded} gambar baru dari Drive ke staging lokal."
+            if failed:
+                msg += f" ({len(failed)} gagal, akan dicoba lagi pada sinkronisasi berikutnya)"
+            logger.info(msg)
 
         if self._cache_folder_id:
             cache_dir = local_root / CACHE_FOLDER_NAME
@@ -196,24 +269,49 @@ class DriveManager:
             cache_files = self._list_children(
                 self._cache_folder_id, extra_query="mimeType = 'application/json'"
             )
+            cache_jobs = []
             for item in cache_files:
                 dst = cache_dir / item["name"]
                 if dst.exists():
                     continue
-                self._download_file(item["id"], dst)
-            logger.info(f"Mengunduh {len(cache_files)} berkas cache dari Drive.")
+                cache_jobs.append((item["id"], dst))
+
+            if cache_jobs:
+                downloaded, failed = self._run_in_pool(
+                    cache_jobs, self._download_job, lambda job: job[1].name, "drive-download",
+                )
+                msg = f"Mengunduh {downloaded} berkas cache dari Drive."
+                if failed:
+                    msg += f" ({len(failed)} gagal)"
+                logger.info(msg)
 
         logger.info(f"Folder Drive berhasil disinkronkan ke staging lokal: {local_root}")
         return local_root
 
+    def _download_job(self, job: tuple):
+        file_id, dst = job
+        self._download_file(file_id, dst)
+
     def _download_file(self, file_id: str, dst: Path):
+        """
+        Mengunduh satu berkas dari Drive langsung ke disk secara streaming (chunk demi
+        chunk sebesar DRIVE_DOWNLOAD_CHUNK_SIZE), tanpa menahan seluruh isi berkas di RAM
+        sekaligus — penting karena dipanggil konkuren oleh beberapa worker thread, dan foto
+        bisa berukuran beberapa MB per berkas (beda jauh dari cache JSON yang cuma puluhan KB).
+        """
         request = self.service.files().get_media(fileId=file_id)
-        buffer = io.BytesIO()
-        downloader = MediaIoBaseDownload(buffer, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-        dst.write_bytes(buffer.getvalue())
+        request.http = self._thread_http()
+        try:
+            with open(dst, "wb") as fh:
+                downloader = MediaIoBaseDownload(fh, request, chunksize=DRIVE_DOWNLOAD_CHUNK_SIZE)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk(num_retries=_API_NUM_RETRIES)
+        except Exception:
+            # Jangan tinggalkan berkas parsial — kalau tidak, dst.exists() akan salah
+            # mengira berkas ini sudah lengkap dan melewatkannya pada sinkronisasi berikutnya.
+            dst.unlink(missing_ok=True)
+            raise
 
     def upload_new_cache_files(self, local_root: Path):
         """
@@ -235,16 +333,26 @@ class DriveManager:
             for item in self._list_children(self._cache_folder_id, extra_query="mimeType = 'application/json'")
         }
 
-        uploaded = 0
-        for json_file in cache_dir.glob("*.json"):
-            if json_file.name in existing_names:
-                continue
-            metadata = {"name": json_file.name, "parents": [self._cache_folder_id]}
-            media = MediaFileUpload(str(json_file), mimetype="application/json")
-            self.service.files().create(body=metadata, media_body=media, fields="id").execute()
-            uploaded += 1
+        pending = [f for f in cache_dir.glob("*.json") if f.name not in existing_names]
+        if not pending:
+            logger.info("Tidak ada berkas cache baru untuk diunggah ke Drive.")
+            return
 
-        logger.info(f"Mengunggah {uploaded} berkas cache baru ke folder '.face_cache' di Drive.")
+        uploaded, failed = self._run_in_pool(
+            pending, self._upload_cache_file, lambda f: f.name, "drive-upload",
+        )
+
+        msg = f"Mengunggah {uploaded} berkas cache baru ke folder '.face_cache' di Drive."
+        if failed:
+            msg += f" ({len(failed)} gagal, akan dicoba lagi pada sinkronisasi berikutnya)"
+        logger.info(msg)
+
+    def _upload_cache_file(self, json_file: Path):
+        metadata = {"name": json_file.name, "parents": [self._cache_folder_id]}
+        media = MediaFileUpload(str(json_file), mimetype="application/json")
+        self.service.files().create(
+            body=metadata, media_body=media, fields="id",
+        ).execute(http=self._thread_http(), num_retries=_API_NUM_RETRIES)
 
     def copy_matches_to_drive_results(self, relative_paths: list[str]) -> str | None:
         """
@@ -268,7 +376,10 @@ class DriveManager:
             item["name"] for item in self._list_children(self._results_folder_id)
         }
 
-        copied = 0
+        # Tentukan nama tujuan unik untuk tiap foto dulu, sekuensial dan murni lokal
+        # (tanpa panggilan jaringan), sebelum menyalin secara paralel — supaya dua worker
+        # thread tidak pernah berebut/bentrok memilih nama tujuan yang sama.
+        jobs = []  # list of (file_id, dst_name)
         for rel_path in relative_paths:
             file_id = self._image_map.get(rel_path)
             if not file_id:
@@ -284,12 +395,26 @@ class DriveManager:
                     counter += 1
                 dst_name = f"{stem}_{counter}{suffix}"
 
-            self.service.files().copy(
-                fileId=file_id,
-                body={"name": dst_name, "parents": [self._results_folder_id]},
-            ).execute()
             existing_names.add(dst_name)
-            copied += 1
+            jobs.append((file_id, dst_name))
 
-        logger.info(f"Menyalin {copied} foto hasil pencocokan ke folder '{RESULTS_FOLDER_NAME}' di Drive.")
+        if not jobs:
+            logger.info(f"Tidak ada foto hasil pencocokan yang disalin ke folder '{RESULTS_FOLDER_NAME}' di Drive.")
+            return self._results_folder_id
+
+        copied, failed = self._run_in_pool(
+            jobs, self._copy_one_result, lambda job: job[1], "drive-copy",
+        )
+
+        msg = f"Menyalin {copied} foto hasil pencocokan ke folder '{RESULTS_FOLDER_NAME}' di Drive."
+        if failed:
+            msg += f" ({len(failed)} gagal)"
+        logger.info(msg)
         return self._results_folder_id
+
+    def _copy_one_result(self, job: tuple):
+        file_id, dst_name = job
+        self.service.files().copy(
+            fileId=file_id,
+            body={"name": dst_name, "parents": [self._results_folder_id]},
+        ).execute(http=self._thread_http(), num_retries=_API_NUM_RETRIES)
