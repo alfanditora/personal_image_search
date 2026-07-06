@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 import cv2
 import numpy as np
+import psutil
 
 CHUNK_SIZE = 16  # images per batch-embedding call
 
@@ -48,7 +49,15 @@ class PipelineWorker(threading.Thread):
     def run(self):
         try:
             logger.info("PipelineWorker diluncurkan di background.")
-            
+
+            # Pemanasan pengukuran CPU: panggilan pertama cpu_percent() selalu tidak berarti,
+            # dipakai di sini hanya untuk menandai titik awal interval pengukuran.
+            proc = psutil.Process(os.getpid())
+            cpu_count = psutil.cpu_count() or 1
+            proc.cpu_percent(interval=None)
+            # RSS sebelum proses berjalan (baseline untuk memory incremental seluruh run ini)
+            mem_before_mb = proc.memory_info().rss / (1024 ** 2)
+
             # Import backend secara dinamis di dalam thread agar aman
             from utils.file_manager import FileManager
             from core.detector import FaceDetector
@@ -98,9 +107,12 @@ class PipelineWorker(threading.Thread):
 
             if total_photos == 0:
                 logger.info("Tidak ada gambar valid yang ditemukan di direktori input.")
+                mem_after_mb = proc.memory_info().rss / (1024 ** 2)
                 self.on_finished(0, {
                     "drive_sync_time": drive_download_time + drive_upload_time,
                     "faces_detected": len(existing_cache),
+                    "cpu_usage_percent": proc.cpu_percent(interval=None) / cpu_count,
+                    "memory_incremental_mb": max(0.0, mem_after_mb - mem_before_mb),
                 })
                 return
 
@@ -174,6 +186,7 @@ class PipelineWorker(threading.Thread):
                     except Exception as e:
                         logger.error(f"Gagal menyinkronkan cache baru ke Google Drive: {str(e)}")
 
+                mem_after_mb = proc.memory_info().rss / (1024 ** 2)
                 timings = {
                     "detection":  detector.total_detection_time,
                     "alignment":  detector.total_alignment_time,
@@ -182,6 +195,8 @@ class PipelineWorker(threading.Thread):
                     "faces_detected": len(existing_cache) + new_faces_count,
                     "new_faces_detected": new_faces_count,
                     "drive_sync_time": drive_download_time + drive_upload_time,
+                    "cpu_usage_percent": proc.cpu_percent(interval=None) / cpu_count,
+                    "memory_incremental_mb": max(0.0, mem_after_mb - mem_before_mb),
                 }
                 self.on_finished(processed_count, timings)
                 

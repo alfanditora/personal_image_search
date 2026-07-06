@@ -577,17 +577,29 @@ class DemoApp(MainApp):
             self._index_timings.get("drive_sync_time", 0.0)
             + getattr(self.active_worker, "drive_sync_time", 0.0)
         )
+        # Memory footprint saat model detector/embedder pertama kali dimuat (RSS proses)
+        model_init_memory_mb = self._index_timings.get("model_init_memory_mb")
+        # Memory incremental: pertambahan RSS proses selama loop pengindeksan terakhir berjalan
+        # (deteksi + alignment + embedding seluruh foto baru), terpisah dari footprint inisialisasi model
+        memory_incremental_mb = self._index_timings.get("memory_incremental_mb")
+        # Penggunaan CPU proses selama proses pengindeksan terakhir berjalan
+        cpu_usage_percent = self._index_timings.get("cpu_usage_percent")
 
         self._render_report(tp, fp, fn, tn, precision, recall, f1, accuracy,
                             person_label=person_label,
                             total_images=total_images,
                             positive_count=len(gt_positive),
                             faces_detected=faces_detected,
-                            drive_sync_time=drive_sync_time)
+                            drive_sync_time=drive_sync_time,
+                            model_init_memory_mb=model_init_memory_mb,
+                            memory_incremental_mb=memory_incremental_mb,
+                            cpu_usage_percent=cpu_usage_percent)
 
     def _render_report(self, tp, fp, fn, tn, precision, recall, f1, accuracy,
                        person_label=None, total_images=None, positive_count=None,
-                       faces_detected=None, drive_sync_time=0.0):
+                       faces_detected=None, drive_sync_time=0.0,
+                       model_init_memory_mb=None, memory_incremental_mb=None,
+                       cpu_usage_percent=None):
         for w in self._report_frame.winfo_children():
             w.destroy()
 
@@ -767,6 +779,49 @@ class DemoApp(MainApp):
                 font=ctk.CTkFont(FONT_BODY, 9, "bold"), text_color=C_SUBTEXT,
                 fg_color=bg,
             ).pack(pady=(2, 9))
+
+        # ── Sumber daya: memory footprint & CPU usage ───────────────────────────
+        resource_tiles = []
+        if model_init_memory_mb is not None:
+            resource_tiles.append((
+                "Memory Footprint (Inisialisasi Model)",
+                f"{model_init_memory_mb:.1f} MB", C_DETECT_BG, C_DETECT_FG,
+            ))
+        if memory_incremental_mb is not None:
+            resource_tiles.append((
+                "Memory Incremental (Proses Indeksasi)",
+                f"+{memory_incremental_mb:.1f} MB", C_FN_BG, C_FN_FG,
+            ))
+        if cpu_usage_percent is not None:
+            resource_tiles.append((
+                "CPU Usage (Pengindeksan)",
+                f"{cpu_usage_percent:.1f}%", C_TP_BG, C_TP_FG,
+            ))
+
+        if resource_tiles:
+            ctk.CTkLabel(
+                self._report_body, text="SUMBER DAYA",
+                font=ctk.CTkFont(FONT_BODY, 9, "bold"), text_color=C_MUTED,
+                fg_color=BG_CARD, anchor="w",
+            ).pack(fill="x", padx=20, pady=(0, 6))
+
+            resource_row = ctk.CTkFrame(self._report_body, fg_color=BG_CARD)
+            resource_row.pack(fill="x", padx=20, pady=(0, 18))
+
+            for name, val, bg, fg in resource_tiles:
+                tile = ctk.CTkFrame(resource_row, fg_color=bg, corner_radius=9,
+                                    border_width=1, border_color=C_BORDER)
+                tile.pack(side="left", expand=True, fill="x", padx=4)
+                ctk.CTkLabel(
+                    tile, text=val,
+                    font=ctk.CTkFont(FONT_TITLE, 14, "bold"), text_color=fg,
+                    fg_color=bg,
+                ).pack(pady=(9, 0))
+                ctk.CTkLabel(
+                    tile, text=name,
+                    font=ctk.CTkFont(FONT_BODY, 9, "bold"), text_color=C_SUBTEXT,
+                    fg_color=bg,
+                ).pack(pady=(2, 9))
 
         self._apply_report_collapsed_state()
         self._report_frame.grid(row=1, column=0, sticky="ew", padx=20, pady=(8, 0))

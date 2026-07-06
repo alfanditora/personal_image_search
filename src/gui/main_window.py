@@ -3,6 +3,7 @@ import gc
 import time
 import logging
 import threading
+import psutil
 from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, Canvas
 import customtkinter as ctk
@@ -73,6 +74,9 @@ class MainApp(ctk.CTk):
 
         # indexing timing breakdown (populated by _on_index_finished)
         self._index_timings = {}
+
+        # memory footprint saat model detector/embedder pertama kali dimuat (RSS proses)
+        self._model_init_memory_mb = 0.0
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_safe_close)
@@ -433,8 +437,15 @@ class MainApp(ctk.CTk):
             from core.embedder import ArcFaceEmbedder
             self._set_status("Memuat model SCRFD + ArcFace...", C_WARNING)
             self.update_idletasks()
+
+            # Memory footprint inisialisasi pertama: RSS proses sebelum vs sesudah model dimuat
+            proc = psutil.Process(os.getpid())
+            mem_before = proc.memory_info().rss / (1024 ** 2)
             self.detector = FaceDetector("scrfd")
             self.embedder = ArcFaceEmbedder()
+            mem_after = proc.memory_info().rss / (1024 ** 2)
+            self._model_init_memory_mb = max(0.0, mem_after - mem_before)
+
             self.engine_badge.configure(text="●  SCRFD + ArcFace  |  ONLINE", text_color=C_SUCCESS)
             self._set_status("Model siap.", C_SUCCESS)
             return True
@@ -493,6 +504,7 @@ class MainApp(ctk.CTk):
 
     def _on_index_finished(self, count, timings=None):
         self._index_timings = timings or {}
+        self._index_timings["model_init_memory_mb"] = self._model_init_memory_mb
         def _u():
             self.progress_bar.set(1)
             self.prog_pct.configure(text="100%")
@@ -799,6 +811,7 @@ class MainApp(ctk.CTk):
         self.engine_badge.configure(text="●  SCRFD + ArcFace  |  OFFLINE", text_color=C_MUTED)
 
         self._index_timings = {}
+        self._model_init_memory_mb = 0.0
 
         # Paksa garbage collection agar objek besar (model, embedding, thumbnail) yang
         # baru dilepas referensinya benar-benar dibebaskan oleh Python secepatnya
