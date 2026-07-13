@@ -63,8 +63,8 @@ class MainApp(ctk.CTk):
         self.thumbnails     = []
         self._thumb_executor = ThreadPoolExecutor(max_workers=THUMB_POOL_WORKERS, thread_name_prefix="thumb")
         self._load_more_btn = None
-        self._gallery_matches = []
-        self._gallery_gt_basenames = None
+        self._gallery_items = []  # list of (match_dict, result_label) tuples — full, unfiltered
+        self._gallery_filter = None  # None/"ALL" or "TP"/"FP"/"FN" — narrows what's rendered
         self._gallery_shown = 0
 
         # timer state
@@ -595,15 +595,27 @@ class MainApp(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _clear_gallery(self):
+        # Membersihkan widget yang dirender saja — TIDAK mereset _gallery_items,
+        # supaya ganti filter (TP/FP/FN) bisa merender ulang tanpa perlu pencarian baru.
         for w in self.gallery_scroll.winfo_children():
             w.destroy()
         self._load_more_btn = None
-        self._gallery_matches = []
-        self._gallery_gt_basenames = None
         self._gallery_shown = 0
+
+    def _filtered_gallery_items(self):
+        filt = self._gallery_filter
+        if not filt or filt == "ALL":
+            return self._gallery_items
+        return [item for item in self._gallery_items if item[1] == filt]
+
+    def _set_gallery_filter(self, filt: str):
+        self._gallery_filter = filt
+        self._clear_gallery()
+        self._render_more_results()
 
     def _show_empty_state(self, no_results=False):
         self._clear_gallery()
+        self._gallery_items = []
         text = (
             "Tidak ada foto yang cocok\nuntuk selfie ini."
             if no_results
@@ -614,42 +626,61 @@ class MainApp(ctk.CTk):
             font=ctk.CTkFont(FONT_BODY, 14), text_color=C_MUTED, justify="center",
         ).pack(expand=True, pady=80)
 
-    def _display_gallery(self, matches: list, gt_basenames: set = None):
+    def _display_gallery(self, matches: list, gt_basenames: set = None, fn_matches: list = None):
         # Render hasil secara bertahap (paginated) — membuat card + thumbnail untuk
         # ribuan hasil sekaligus adalah sumber utama overhead RAM setelah pencarian
         # selesai, jadi hanya GALLERY_PAGE_SIZE pertama yang dirender di awal.
         self._clear_gallery()
-        self._gallery_matches = matches
-        self._gallery_gt_basenames = gt_basenames
+
+        items = []
+        for match in matches:
+            label = None
+            if gt_basenames is not None:
+                basename = os.path.basename(match.get("file_name", ""))
+                label = "TP" if basename in gt_basenames else "FP"
+            items.append((match, label))
+        # False Negative: foto positif ground truth yang tidak ditemukan pencarian
+        # (mode Demo saja — lihat DemoApp._build_fn_matches).
+        for match in (fn_matches or []):
+            items.append((match, "FN"))
+        self._gallery_items = items
+        self._gallery_filter = None  # reset ke "Semua" setiap ada hasil pencarian baru
+        if hasattr(self, "_sync_gallery_filter_ui"):
+            self._sync_gallery_filter_ui()
+
         COLS = 3
         for col in range(COLS):
             self.gallery_scroll.grid_columnconfigure(col, weight=1)
         self._render_more_results()
 
     def _render_more_results(self):
-        matches = self._gallery_matches
-        gt_basenames = self._gallery_gt_basenames
+        items = self._filtered_gallery_items()
         COLS = 3
         start = self._gallery_shown
-        end = min(start + GALLERY_PAGE_SIZE, len(matches))
+
+        if start == 0 and not items and self._gallery_items:
+            # Ada hasil, tapi tidak ada yang cocok dengan filter kategori yang aktif.
+            ctk.CTkLabel(
+                self.gallery_scroll, text="\nTidak ada foto pada kategori ini.",
+                font=ctk.CTkFont(FONT_BODY, 13), text_color=C_MUTED, justify="center",
+            ).pack(expand=True, pady=60)
+            return
+
+        end = min(start + GALLERY_PAGE_SIZE, len(items))
 
         if self._load_more_btn is not None:
             self._load_more_btn.destroy()
             self._load_more_btn = None
 
         for idx in range(start, end):
-            match = matches[idx]
+            match, label = items[idx]
             row, col = divmod(idx, COLS)
-            basename = os.path.basename(match.get("file_name", ""))
-            label = None
-            if gt_basenames is not None:
-                label = "TP" if basename in gt_basenames else "FP"
             card = self._make_card(match, result_label=label)
             card.grid(row=row, column=col, padx=8, pady=8, sticky="nsew")
 
         self._gallery_shown = end
-        if end < len(matches):
-            remaining = len(matches) - end
+        if end < len(items):
+            remaining = len(items) - end
             btn_row = (end - 1) // COLS + 1
             self._load_more_btn = ctk.CTkButton(
                 self.gallery_scroll,
@@ -683,7 +714,7 @@ class MainApp(ctk.CTk):
         img_label.place(relx=0.5, rely=0.5, anchor="center")
 
         if result_label is not None:
-            badge_color = C_SUCCESS if result_label == "TP" else C_ERROR
+            badge_color = {"TP": C_SUCCESS, "FP": C_ERROR, "FN": C_WARNING}.get(result_label, C_ERROR)
             ctk.CTkLabel(
                 thumb_frame, text=result_label,
                 font=ctk.CTkFont(FONT_BODY, 10, "bold"),

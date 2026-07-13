@@ -231,6 +231,12 @@ class SearchWorker(threading.Thread):
         self.embedder = embedder
         self.drive_link = drive_link
         self.drive_sync_time = 0.0  # total waktu unduh+unggah Drive pada run ini (diisi oleh run())
+        # Diisi oleh run() setelah selesai — dipakai oleh mode Demo untuk menyusun
+        # kartu False Negative (foto ground truth yang gagal ditemukan pencarian).
+        self.cache_list = None
+        self.selfie_embedding = None
+        self.effective_folder = None
+        self.is_drive = False
         self._stop_event = threading.Event()
         self.daemon = True
 
@@ -265,6 +271,9 @@ class SearchWorker(threading.Thread):
                 self.drive_sync_time += time.time() - _t0
                 effective_folder = str(local_root)
 
+            self.effective_folder = effective_folder
+            self.is_drive = drive is not None
+
             # Inisialisasi
             fm = FileManager(effective_folder)
             detector = self.detector if self.detector is not None else FaceDetector("scrfd")
@@ -294,13 +303,15 @@ class SearchWorker(threading.Thread):
             
             # Ekstraksi embedding selfie kueri (L2 Normalized)
             selfie_embedding = embedder.extract_embedding(selfie_cropped)
-            
+            self.selfie_embedding = selfie_embedding
+
             # 2. Muat Basis Data Cache RAM secara Batch
             if self.stopped():
                 return
             self.on_progress("Memuat basis data cache wajah lokal (.face_cache/) ke RAM...")
             cache_list = cache_handler.muat_seluruh_cache()
-            
+            self.cache_list = cache_list
+
             if not cache_list:
                 self.on_error("Basis data cache wajah lokal kosong. Silakan lakukan 'Pindai & Indeks Foto' terlebih dahulu.")
                 return

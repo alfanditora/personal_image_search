@@ -318,7 +318,7 @@ class DemoApp(MainApp):
         self._gal_frame = ctk.CTkFrame(parent, fg_color=BG_MAIN, corner_radius=0)
         self._gal_frame.grid(row=0, column=1, sticky="nsew")
         self._gal_frame.grid_columnconfigure(0, weight=1)
-        self._gal_frame.grid_rowconfigure(2, weight=1)
+        self._gal_frame.grid_rowconfigure(3, weight=1)
 
         hdr_row = ctk.CTkFrame(self._gal_frame, fg_color=BG_MAIN, height=52)
         hdr_row.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 0))
@@ -336,7 +336,26 @@ class DemoApp(MainApp):
         )
         self.result_count_label.grid(row=0, column=1, sticky="e")
 
-        # Report panel (row=1, hidden until metrics are ready)
+        # ── Filter kategori (Semua / TP / FP / FN) — supaya tidak perlu scroll
+        # untuk mencari kartu FP/FN di antara ratusan kartu TP ────────────────
+        self._gallery_filter_var = ctk.StringVar(value="Semua")
+        filter_row = ctk.CTkFrame(self._gal_frame, fg_color=BG_MAIN)
+        filter_row.grid(row=1, column=0, sticky="ew", padx=20, pady=(10, 0))
+
+        self._gallery_filter_seg = ctk.CTkSegmentedButton(
+            filter_row,
+            values=["Semua", "TP", "FP", "FN"],
+            variable=self._gallery_filter_var,
+            font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+            fg_color=BG_TRACK,
+            selected_color=C_ACCENT, selected_hover_color=C_ACCENT_HV,
+            unselected_color=BG_TRACK, unselected_hover_color="#DEDCD1",
+            text_color=C_TEXT,
+            command=self._on_gallery_filter_changed,
+        )
+        self._gallery_filter_seg.pack(side="left")
+
+        # Report panel (row=2, hidden until metrics are ready)
         self._report_frame = ctk.CTkFrame(
             self._gal_frame, fg_color=BG_CARD, corner_radius=12,
             border_width=1, border_color=C_BORDER,
@@ -348,9 +367,22 @@ class DemoApp(MainApp):
             scrollbar_button_hover_color=C_MUTED,
             scrollbar_fg_color=BG_MAIN,
         )
-        self.gallery_scroll.grid(row=2, column=0, sticky="nsew", padx=(20, 8), pady=(8, 16))
+        self.gallery_scroll.grid(row=3, column=0, sticky="nsew", padx=(20, 8), pady=(8, 16))
 
         self._show_empty_state()
+
+    # ── Gallery filter callback ────────────────────────────────────────────────
+
+    _FILTER_LABEL_TO_KEY = {"Semua": "ALL", "TP": "TP", "FP": "FP", "FN": "FN"}
+
+    def _on_gallery_filter_changed(self, value):
+        self._set_gallery_filter(self._FILTER_LABEL_TO_KEY.get(value, "ALL"))
+
+    def _sync_gallery_filter_ui(self):
+        # Dipanggil oleh MainApp._display_gallery setiap ada hasil pencarian baru,
+        # supaya filter kembali ke "Semua" alih-alih menyisakan pilihan lama.
+        if hasattr(self, "_gallery_filter_var"):
+            self._gallery_filter_var.set("Semua")
 
     # ── Threshold callback ────────────────────────────────────────────────────
 
@@ -373,6 +405,9 @@ class DemoApp(MainApp):
 
         self._threshold.set(0.60)
         self.thresh_val_label.configure(text="0.60")
+
+        self._gallery_filter = None
+        self._sync_gallery_filter_ui()
 
         self._hide_report()
 
@@ -503,18 +538,7 @@ class DemoApp(MainApp):
             self._stop_timer()
             self._set_buttons_state("normal")
 
-            if not matches:
-                self._set_status("Tidak ada foto yang cocok.", C_WARNING)
-                self._show_empty_state(no_results=True)
-                self.result_count_label.configure(text="0 hasil")
-                self._hide_report()
-                return
-
-            self._set_status(f"Ditemukan {len(matches)} foto cocok.", C_SUCCESS)
-            self.result_count_label.configure(text=f"{len(matches)} foto")
-
             gt_basenames = None
-
             if self._ground_truth_raw:
                 # Multi-person GT: extract column for the selected person
                 person_key = PERSON_KEY_MAP.get(
@@ -524,18 +548,104 @@ class DemoApp(MainApp):
                     fname for fname, labels in self._ground_truth_raw.items()
                     if labels.get(person_key) is True
                 }
-                self._compute_and_show_report(matches, gt_basenames)
-
             elif self._ground_truth:
                 # Flat GT
                 gt_basenames = {k for k, v in self._ground_truth.items() if v}
-                self._compute_and_show_report(matches, gt_basenames)
 
+            fn_matches = []
+            if gt_basenames is not None:
+                fn_matches = self._build_fn_matches(matches, gt_basenames)
+                self._compute_and_show_report(matches, gt_basenames)
             else:
                 self._hide_report()
 
-            self._display_gallery(matches, gt_basenames=gt_basenames)
+            total_shown = len(matches) + len(fn_matches)
+
+            if total_shown == 0:
+                self._set_status("Tidak ada foto yang cocok.", C_WARNING)
+                self._show_empty_state(no_results=True)
+                self.result_count_label.configure(text="0 hasil")
+                return
+
+            if matches:
+                self._set_status(f"Ditemukan {len(matches)} foto cocok.", C_SUCCESS)
+            else:
+                self._set_status("Tidak ada foto cocok ditemukan; kartu FN ditampilkan.", C_WARNING)
+
+            self.result_count_label.configure(
+                text=f"{len(matches)} foto  ·  {len(fn_matches)} FN"
+                if gt_basenames is not None else f"{len(matches)} foto"
+            )
+
+            self._display_gallery(matches, gt_basenames=gt_basenames, fn_matches=fn_matches)
         self.after(0, _u)
+
+    # ── False Negative reconstruction (demo only) ──────────────────────────────
+
+    def _build_fn_matches(self, matches: list, gt_positive: set) -> list:
+        """Foto ground truth positif yang gagal ditemukan pencarian (di bawah TP).
+        Direkonstruksi dari cache indexing (atau, jika wajahnya tak pernah
+        terdeteksi sama sekali, dari pemindaian folder langsung) supaya tetap
+        bisa ditampilkan sebagai kartu FN di galeri demo."""
+        matched_basenames = {os.path.basename(m.get("file_name", "")) for m in matches}
+        fn_basenames = gt_positive - matched_basenames
+        if not fn_basenames:
+            return []
+
+        worker = self.active_worker
+        cache_list = getattr(worker, "cache_list", None) or []
+        effective_folder = getattr(worker, "effective_folder", None) or self.folder_path
+        is_drive = getattr(worker, "is_drive", False)
+        selfie_embedding = getattr(worker, "selfie_embedding", None)
+
+        cache_by_basename = {}
+        for item in cache_list:
+            b = os.path.basename(item.get("file_name", ""))
+            if b in fn_basenames and b not in cache_by_basename:
+                cache_by_basename[b] = item
+
+        from core.matcher import FaceMatcher
+        matcher = FaceMatcher()
+
+        fn_matches = []
+        for basename in fn_basenames:
+            item = cache_by_basename.get(basename)
+            file_path = None
+            distance, similarity = 1.0, 0.0
+
+            if item is not None:
+                rel_name = item.get("file_name", basename)
+                file_path = (
+                    os.path.join(effective_folder, rel_name) if is_drive
+                    else item.get("file_path") or os.path.join(effective_folder, rel_name)
+                )
+                emb = item.get("embedding")
+                if selfie_embedding is not None and emb is not None:
+                    distance = matcher.hitung_kesamaan_cosine(selfie_embedding, emb)
+                    similarity = 1.0 - distance
+            else:
+                # Wajah tak pernah terdeteksi saat indexing (mis. sudut/pencahayaan
+                # buruk) — cari langsung berdasarkan nama berkas di folder.
+                file_path = self._locate_file_by_basename(effective_folder, basename)
+
+            if file_path and os.path.exists(file_path):
+                fn_matches.append({
+                    "file_name": basename,
+                    "file_path": file_path,
+                    "similarity": similarity,
+                    "cosine_distance": distance,
+                })
+        return fn_matches
+
+    @staticmethod
+    def _locate_file_by_basename(root_folder: str, basename: str):
+        if not root_folder or not os.path.isdir(root_folder):
+            return None
+        for dirpath, dirnames, files in os.walk(root_folder):
+            dirnames[:] = [d for d in dirnames if d not in (".face_cache", "Hasil_Pencarian_Selfie")]
+            if basename in files:
+                return os.path.join(dirpath, basename)
+        return None
 
     # ── Report panel ──────────────────────────────────────────────────────────
 
@@ -824,7 +934,7 @@ class DemoApp(MainApp):
                 ).pack(pady=(2, 9))
 
         self._apply_report_collapsed_state()
-        self._report_frame.grid(row=1, column=0, sticky="ew", padx=20, pady=(8, 0))
+        self._report_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(8, 0))
 
     def _toggle_report(self):
         self._report_collapsed = not self._report_collapsed
